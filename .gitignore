@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Trained model artifacts (large binary files — store separately or via Git LFS)
+models/ogt_mlp/*.pkl
+models/ogt_mlp/*.json
+models/tpc_pinn/*.pt
+models/tpc_pinn/*.pkl
+models/*.xml
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Example outputs
+examples/output/
