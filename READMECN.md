@@ -1,76 +1,90 @@
-# 微生物生长温度性能曲线预测工具包（MGTP）
+# 微生物生长温度性能曲线预测工具包
 
-本工具包可以根据三类输入，为微生物生成完整的**温度性能曲线（TPC）**：
-
-| 输入 | 说明 |
-|---|---|
-| 基因组特征 | 526维预计算特征（rRNA、氨基酸使用频率、密码子使用频率等） |
-| 蛋白质组ESM嵌入 | 基于ESM-2蛋白质语言模型的均值池化向量 |
-| 培养基组成 | FBA交换反应上界（可选） |
+基于物理约束深度学习，通过基因组 FASTA 文件预测微生物完整**温度性能曲线（TPC）**，
+并可通过 FBA 将归一化曲线锚定为绝对生长速率。
 
 ---
 
 ## 工作原理
 
 ```
-基因组特征（526维）
-       |
-       v
-  +----------+
-  |  OGT MLP |  sklearn MLP（256-128-64），在3131个基因组上训练
-  +----------+
-       | OGT（°C）
-       v
-  +----------------------------------------------------+
-  |  TPC形状  -  PINN/UDE（来自Hybrid-TPC-Model）      |
-  |    ESM Transformer -> UTPC参数（Pmax, E）           |
-  |    + 约束残差ODE校正                                |
-  +----------------------------------------------------+
-       | 归一化形状（峰值=1）
-       v
-  +----------+
-  | FBA锚点  |  COBRApy FBA（使用指定培养基）（可选）
-  +----------+
-       | 峰值生长速率（h-1）
-       v
-  绝对TPC：growth_rate(T) = shape(T) × FBA峰值速率
+基因组 FASTA
+    |
+    |---[Prodigal 基因预测]---> 蛋白质序列
+    |       |
+    |       |--> ESM-2 均值池化嵌入向量（1280 维）
+    |       |          |
+    |       |    +-----+-----------------------------+
+    |       |    |   core_model.py（UDE 模型）        |
+    |       |    |   ESM编码器 + UTPC ODE 物理约束    |
+    |       |    |   + 约束残差 MLP 修正              |
+    |       |    +-----+-----------------------------+
+    |       |          | 归一化 TPC 曲线形状（峰值 = 1）
+    |       |          v
+    |       +--> 密码子/氨基酸/二肽特征（526 维）
+    |                  |
+    |            +-----+----------+
+    |            |  OGT_predictor |  sklearn MLP（256-128-64）
+    |            +-----+----------+
+    |                  | OGT（°C）<-- 锚定 UTPC 中的 Topt
+    |
+    |---[CarveMe GEM 重建]
+    |           |
+    |    +-------+----------+
+    |    | FBA_anchor_point |  COBRApy FBA（使用指定培养基）
+    |    +-------+----------+
+    |            | 峰值生长速率（h-1）
+    |
+    绝对 TPC(T) = 归一化形状(T) × 峰值速率
 ```
 
-### 第一阶段 — OGT预测
-MLP替代了原始的±5°C噪声模拟器。
-交叉验证性能（10折，n=3131）：**RMSE 5.12°C | MAE 3.91°C | R² 0.87**
+### 第一阶段 —— OGT 预测
+`OGT_predictor.py` 提取 526 维基因组特征（rRNA 组成、氨基酸使用频率、密码子使用频率、二肽频率），
+使用在 3131 个基因组（2869 细菌 + 262 古菌）上训练的 MLP 预测最适生长温度（OGT）。
 
-### 第二阶段 — TPC形状预测
-使用**Hybrid-TPC-Model**中预训练的UDE模型，以ESM-2蛋白质组嵌入为输入，
-以预测OGT为Topt锚点，输出归一化的TPC曲线形状。
+10 折交叉验证性能：**RMSE 5.12°C | MAE 3.91°C | R2 0.87**
 
-### 第三阶段 — FBA峰值锚点
-在预测OGT下，使用给定培养基运行FBA，所得最大生长速率作为TPC峰值的
-绝对锚点。如不提供代谢模型，输出保持归一化形式。
+### 第二阶段 —— TPC 形状预测（核心模型）
+`core_model.py` 训练 UDE（通用微分方程）模型：基于 ESM-2 的 Transformer 编码器预测
+UTPC 物理参数（Pmax、E），以 Eppley 型 ODE 为物理基础，约束残差 MLP 修正轨迹。
+OGT 直接作为 Topt 的硬锚点。
+
+### 第三阶段 —— 绝对锚定（可选）
+`FBA_anchor_point.py` 使用 CarveMe 重建基因组规模代谢模型（GEM），
+在给定培养基条件下运行 FBA，获取绝对峰值生长速率。
 
 ---
 
 ## 目录结构
 
 ```
-MGTP/
-├── mgtp/                    # Python 包
-│   ├── __init__.py
-│   ├── ogt_predictor.py     # OGT MLP 包装器
-│   ├── tpc_shape.py         # PINN 形状预测器（架构 + 加载器）
-│   ├── fba_anchor.py        # COBRApy FBA 包装器
-│   └── pipeline.py          # 端到端流程编排
-├── train/
-│   └── train_ogt.py         # 训练并评估OGT MLP，保存模型文件
-├── examples/
-│   ├── example_pipeline.py  # 可运行的示例（场景A和B）
-│   └── example_medium_ecoli.json
-├── models/                  # （不提交到git）— 将训练好的模型放于此处
-│   ├── ogt_mlp/             # mlp.pkl  scaler.pkl  feature_cols.pkl
-│   └── tpc_pinn/            # checkpoint.pt  esm_scaler.pkl
-├── requirements.txt
-├── README.md
-└── READMECN.md
+Microbial-Growth-TPC-Predictor/
+|-- code/
+|   |-- core_model.py          UDE TPC 形状模型训练脚本
+|   |-- TPC_predictor.py       主入口：FASTA + 培养基 -> 绝对 TPC
+|   |-- OGT_predictor.py       OGT MLP：训练与推理
+|   |-- FBA_anchor_point.py    CarveMe GEM 重建 + COBRApy FBA
+|-- data/                      （空目录 — 请在本地放置训练数据）
+|-- results/
+|   |-- core_model_checkpoint.pt   UDE 模型权重
+|   |-- core_model_scaler.pkl      ESM 嵌入标准化器
+|   |-- ogt_mlp/
+|       |-- mlp.pkl                训练好的 OGT MLP
+|       |-- scaler.pkl             特征标准化器
+|       |-- feature_cols.pkl       526 个特征名称列表
+|       |-- cv_results.json        10 折交叉验证指标
+|-- Train/
+|   |-- core_model_training_log.csv    逐轮损失记录
+|   |-- core_model_training_loss.png   损失曲线图
+|   |-- ogt_mlp_cv_log.csv             逐折交叉验证记录
+|-- examples/
+|   |-- example_ecoli.py               大肠杆菌 K-12 MG1655（中温菌）
+|   |-- example_thermus.py             栖热菌 HB8（嗜热菌）
+|   |-- example_medium_ecoli.json      大肠杆菌 M9 最小培养基
+|   |-- example_medium_thermus.json    栖热菌培养基
+|-- requirements.txt
+|-- README.md
+|-- READMECN.md
 ```
 
 ---
@@ -83,124 +97,141 @@ MGTP/
 pip install -r requirements.txt
 ```
 
-### 2. 训练OGT模型
+FBA 支持（可选）：
 
 ```bash
-python train/train_ogt.py \
-    --bacteria_csv /path/to/calculated_features_bacteria.csv \
-    --archaea_csv  /path/to/calculated_features_archaea.csv \
-    --output_dir   models/ogt_mlp
+pip install cobra carveme
+# CarveMe 还需要 DIAMOND；详见 https://carveme.readthedocs.io
 ```
 
-该脚本将：①运行10折交叉验证并打印评估指标，②用全量数据训练最终模型，
-③将模型文件保存到 `models/ogt_mlp/`。
+### 2. 准备数据并训练模型
 
-### 3. 放置TPC PINN模型文件
-
-从 Hybrid-TPC-Model 复制已训练的PINN检查点和Scaler：
+#### 2a. 训练 OGT MLP
 
 ```bash
-cp Hybrid-TPC-Model/results/group4_pinn_checkpoint.pt  models/tpc_pinn/checkpoint.pt
-cp Hybrid-TPC-Model/results/group4_pinn_scaler.pkl     models/tpc_pinn/esm_scaler.pkl
+python code/OGT_predictor.py train \
+    --bacteria_csv data/calculated_features_bacteria.csv \
+    --archaea_csv  data/calculated_features_archaea.csv
 ```
 
-### 4. 使用Python API运行流程
+该脚本运行 10 折交叉验证、打印评估指标、用全量数据训练最终模型，
+并将结果保存到 `results/ogt_mlp/`，交叉验证日志保存到 `Train/`。
+
+#### 2b. 训练核心 TPC 形状模型
+
+将含 ESM-2 嵌入列的 TPC CSV 放到 `data/` 后运行：
+
+```bash
+python code/core_model.py --data data/11800TPC_1_1_with_medium_group_3_with_OGT.csv
+```
+
+训练结果保存到 `results/`，训练日志和损失曲线保存到 `Train/`。
+
+### 3. 从基因组 FASTA 预测 TPC
+
+**仅输出归一化曲线（无 FBA）：**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --temp_min 5 --temp_max 80
+```
+
+**含 FBA 绝对锚定：**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --medium examples/example_medium_ecoli.json \
+    --temp_min 5 --temp_max 80
+```
+
+**手动指定 OGT（跳过 OGT 预测）：**
+
+```bash
+python code/TPC_predictor.py --fasta genome.fna --ogt 37.0
+```
+
+完整流程所需的外部工具：
+- **Prodigal**（基因预测）—— https://github.com/hyattpd/Prodigal
+- **Barrnap**（rRNA 检测）—— https://github.com/tseemann/barrnap
+- **ESM-2** —— `pip install fair-esm` 或 `pip install transformers`
+- **CarveMe**（GEM 重建，仅 FBA 需要）—— `pip install carveme`
+
+### 4. Python API
 
 ```python
 import numpy as np
-import pandas as pd
-from mgtp import MGTPipeline
+import sys
+sys.path.insert(0, "code")
 
-# 不使用FBA，输出归一化TPC
-pipe = MGTPipeline(
-    ogt_model_dir = "models/ogt_mlp",
-    tpc_model_dir = "models/tpc_pinn",
+from TPC_predictor import load_model, predict_shape
+
+model, scaler, meta, device = load_model()
+
+# esm_embedding：目标蛋白质组的 ESM-2 均值池化向量，形状 (1280,)
+result = predict_shape(
+    model, scaler, meta, device,
+    esm_embedding = esm_embedding,
+    ogt_c         = 37.0,
+    temperatures  = np.arange(5, 75, 1),
 )
-
-T, rate, ogt = pipe.predict(
-    esm_embedding     = esm_vec,       # ndarray，形状 (嵌入维度,)
-    genomic_features  = feature_df,    # 包含526列特征的DataFrame
-    temperature_range = np.arange(5, 70, 1),
-)
-print(f"预测OGT：{ogt:.1f}°C")
-print(f"峰值归一化速率：{rate.max():.4f}")
-```
-
-### 5. 使用FBA锚点（输出绝对生长速率）
-
-```python
-pipe = MGTPipeline(
-    ogt_model_dir  = "models/ogt_mlp",
-    tpc_model_dir  = "models/tpc_pinn",
-    fba_model_path = "models/iJO1366.xml",
-)
-
-medium = {
-    "EX_glc__D_e": 10.0,   # 葡萄糖
-    "EX_o2_e":     20.0,   # 氧气
-    "EX_nh4_e":    10.0,   # 铵根离子（氮源）
-}
-
-T, rate, ogt = pipe.predict(
-    esm_embedding    = esm_vec,
-    genomic_features = feature_df,
-    medium           = medium,
-    temperature_range = np.arange(5, 70, 1),
-)
-print(f"FBA峰值生长速率：{rate.max():.4f} h-1")
+print(f"Topt = {result['ToptC']:.1f} C")
+print(f"峰值温度 = {result['temperatures'][result['pred_shape'].argmax()]:.0f} C")
 ```
 
 ---
 
-## 输入规格说明
+## 运行示例
 
-### 基因组特征（526列）
+```bash
+# 大肠杆菌 K-12（中温菌，OGT ~37°C）
+python examples/example_ecoli.py
 
-按与训练数据相同的流程预计算。列名的精确列表存储于
-`models/ogt_mlp/feature_cols.pkl`。
+# 栖热菌 HB8（嗜热菌，OGT ~65°C）
+python examples/example_thermus.py
+```
 
-| 特征组 | 维数 |
-|---|---|
-| 基因组大小 | 1 |
-| rRNA核苷酸组成 + MFE/len（5S / 16S / 23S） | 15 |
-| tRNA核苷酸组成 + MFE/len | 5 |
-| 基因组GC含量（归一化） | 1 |
-| 蛋白质组氨基酸比例（原始 + GC归一化） | 40 |
-| 蛋白质组属性（均值长度、电荷比例） | 4 |
-| 密码子使用频率（同义密码子分布） | 64 |
-| 二肽频率 | 400 |
-
-### ESM嵌入向量
-
-使用ESM-2（如 `facebook/esm2_t33_650M_UR50D`）对蛋白质组进行均值池化，
-维度须与 `models/tpc_pinn/checkpoint.pt` 中保存的 `emb_len` 一致。
-
-### 培养基（FBA用）
-
-字典格式，键为交换反应ID，值为最大摄取速率（mmol gDW⁻¹ h⁻¹）。
-大肠杆菌M9基础培养基示例见 `examples/example_medium_ecoli.json`。
+输出保存到 `examples/output/`。
 
 ---
 
-## OGT模型性能
+## 输入说明
 
-| 划分方式 | RMSE（°C） | MAE（°C） | R² |
-|---|---|---|---|
-| 10折交叉验证（总体） | 5.12 | 3.91 | 0.87 |
-| 最佳fold | 4.58 | 3.50 | 0.92 |
-| 最差fold | 5.75 | 4.31 | 0.80 |
+### 基因组 FASTA
+核苷酸基因组 FASTA（`.fna`）或氨基酸蛋白质组 FASTA（`.faa`）。
+流程自动检测类型（>80% ACGTN 字符 = 核苷酸）。
 
-训练集：2869株细菌 + 262株古菌（GTDB分类体系）。
+### 培养基（FBA 用）
+JSON 字典，键为 COBRA 交换反应 ID，值为最大摄取速率（mmol gDW-1 h-1，正值）。
+大肠杆菌 M9 最小培养基示例见 `examples/example_medium_ecoli.json`。
+
+### 特征 CSV（OGT 训练用）
+每行一个基因组，每列一个特征，必须包含 `OGT` 列。
+列名须与 `results/ogt_mlp/feature_cols.pkl` 中存储的名称一致。
+
+---
+
+## OGT 模型性能
+
+| 划分方式          | RMSE（°C） | MAE（°C） | R2   |
+|------------------|-----------|----------|------|
+| 10 折 CV 总体    | 5.12      | 3.91     | 0.87 |
+| 最佳折           | 4.58      | 3.50     | 0.92 |
+| 最差折           | 5.75      | 4.31     | 0.80 |
+
+训练集：2869 株细菌 + 262 株古菌（GTDB 分类体系）。
 
 ---
 
 ## 引用
 
-如果您在研究中使用了MGTP，请引用：
+如果您在研究中使用了本工具包，请引用：
 
-- **Hybrid-TPC-Model** — PINN/UDE架构来源。
-- 基因组特征数据和OGT标签来源（如TEMPURA数据库、Engqvist 2018）。
-- COBRApy（FBA工具）：Ebrahim et al. (2013) *BMC Systems Biology*。
+- **Hybrid-TPC-Model** —— UDE / UTPC 架构来源。
+- 基因组特征数据与 OGT 标签来源（如 TEMPURA 数据库、Engqvist 2018）。
+- COBRApy（FBA 工具）：Ebrahim et al. (2013) *BMC Systems Biology*。
+- ESM-2：Lin et al. (2023) *Science*。
 
 ---
 

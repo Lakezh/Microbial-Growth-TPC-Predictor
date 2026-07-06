@@ -4,14 +4,20 @@ pandas>=2.0
 scikit-learn>=1.4
 scipy>=1.11
 
-# Deep learning (TPC PINN)
+# Deep learning (core TPC model)
 torch>=2.1
 
-# ODE solver (optional, falls back to RK4 if absent)
+# ODE solver (optional -- falls back to RK4 if absent)
 torchdiffeq>=0.2.3
 
-# FBA anchor (optional)
-cobra>=0.29
+# ESM-2 protein language model (required for ESM embedding extraction)
+# Install ONE of the following:
+#   pip install fair-esm              # Facebook's original library
+#   pip install transformers          # HuggingFace (alternative)
 
-# Visualisation (examples only)
+# FBA absolute scaling (optional)
+cobra>=0.29
+# carveme>=1.5                        # Also needs DIAMOND on PATH
+
+# Visualisation
 matplotlib>=3.8

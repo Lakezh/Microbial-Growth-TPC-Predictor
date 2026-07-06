@@ -1,0 +1,17 @@
+{
+  "_comment": "Defined medium for Thermus thermophilus HB8 (thermophile). Values are maximum uptake rates in mmol gDW-1 h-1.",
+  "EX_glc__D_e":  10.0,
+  "EX_o2_e":      20.0,
+  "EX_nh4_e":     10.0,
+  "EX_pi_e":       5.0,
+  "EX_so4_e":      5.0,
+  "EX_k_e":        5.0,
+  "EX_mg2_e":      5.0,
+  "EX_fe2_e":      0.1,
+  "EX_ca2_e":      5.0,
+  "EX_cl_e":       5.0,
+  "EX_mn2_e":      5.0,
+  "EX_zn2_e":      5.0,
+  "EX_h2o_e":    100.0,
+  "EX_h_e":      100.0
+}

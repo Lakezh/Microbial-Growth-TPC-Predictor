@@ -1,78 +1,93 @@
-# Microbial Growth TPC Predictor (MGTP)
+# Microbial Growth TPC Predictor
 
-A modular toolkit that generates a full **Temperature-Performance Curve (TPC)**
-for a microbial organism from three inputs:
-
-| Input | Description |
-|---|---|
-| Genomic features | 526 pre-computed features (rRNA, amino-acid usage, codon usage) |
-| Proteome ESM embedding | Mean-pooled ESM-2 protein language model vector |
-| Medium composition | Exchange-reaction bounds for FBA (optional) |
+A toolkit for predicting the full **Temperature-Performance Curve (TPC)** of microbial growth
+from a genome FASTA file, using a physics-informed deep learning model anchored by OGT
+prediction and optional FBA-based absolute scaling.
 
 ---
 
 ## How it works
 
 ```
-Genomic features (526-dim)
-         |
-         v
-  +--------------+
-  |   OGT MLP    |  sklearn MLP (256-128-64) trained on 3 131 genomes
-  +--------------+
-         | OGT (degrees C)
-         v
-  +-----------------------------------------------------+
-  |  TPC Shape  -  PINN / UDE (Hybrid-TPC-Model)        |
-  |    ESM Transformer -> UTPC params (Pmax, E)          |
-  |    + constrained residual ODE correction             |
-  +-----------------------------------------------------+
-         | Normalised shape (peak = 1)
-         v
-  +--------------+
-  |  FBA Anchor  |  COBRApy FBA at user-specified medium  (optional)
-  +--------------+
-         | peak growth rate (h-1)
-         v
-  Absolute TPC:  growth_rate(T) = shape(T) x FBA_peak
+Genome FASTA
+    |
+    |---[Prodigal: gene calling]---> protein sequences
+    |       |
+    |       |--> ESM-2 mean-pooled embedding (1280-dim)
+    |       |          |
+    |       |    +-----+-------------------------------+
+    |       |    |   core_model.py (UDE)               |
+    |       |    |   ESMTempEncoder + UTPC ODE physics  |
+    |       |    |   + constrained residual correction  |
+    |       |    +-----+-------------------------------+
+    |       |          | normalised TPC shape (peak = 1)
+    |       |          v
+    |       +--> codon/AA/dipeptide features (526-dim)
+    |                  |
+    |            +-----+----------+
+    |            |  OGT_predictor |  sklearn MLP (256-128-64)
+    |            +-----+----------+
+    |                  | OGT (C)  <-- hard-anchors Topt in UTPC
+    |
+    |---[CarveMe GEM reconstruction]
+    |           |
+    |    +-------+----------+
+    |    | FBA_anchor_point |  COBRApy FBA with user medium
+    |    +-------+----------+
+    |            | peak growth rate (h-1)
+    |
+    absolute TPC(T) = normalised_shape(T) x peak_rate
 ```
 
-### Stage 1 - OGT prediction
-An MLP replaces the original +/-5 C noise simulator.
-CV performance (10-fold, n = 3 131): **RMSE 5.12 C | MAE 3.91 C | R2 0.87**
+### Stage 1 -- OGT prediction
+`OGT_predictor.py` uses 526 genomic features (rRNA composition, amino-acid usage,
+codon usage, dipeptide frequencies) to predict the optimal growth temperature (OGT)
+with an MLP trained on 3131 genomes (2869 Bacteria + 262 Archaea).
 
-### Stage 2 - TPC shape
-The pre-trained UDE model from **Hybrid-TPC-Model** predicts a normalised
-TPC using the ESM-2 proteome embedding anchored at the predicted OGT.
+CV performance (10-fold, n = 3131): **RMSE 5.12 C | MAE 3.91 C | R2 0.87**
 
-### Stage 3 - FBA peak anchor
-FBA is run once at the predicted OGT under the given medium.  The resulting
-maximum growth rate scales the normalised shape into absolute units (h-1).
-If no metabolic model is supplied, the output remains normalised.
+### Stage 2 -- TPC shape (core model)
+`core_model.py` trains a UDE (Universal Differential Equation) model: an
+ESM-2-based transformer encoder generates UTPC physics parameters (Pmax, E),
+which seed an Eppley-style ODE; a constrained residual MLP corrects the trajectory.
+OGT is used directly as a hard anchor for Topt.
+
+### Stage 3 -- Absolute scaling (optional)
+`FBA_anchor_point.py` reconstructs a genome-scale metabolic model with CarveMe
+and runs FBA under the user-specified medium to obtain the absolute peak growth rate.
 
 ---
 
 ## Repository layout
 
 ```
-MGTP/
-├── mgtp/                    # Python package
-│   ├── __init__.py
-│   ├── ogt_predictor.py     # OGT MLP wrapper
-│   ├── tpc_shape.py         # PINN shape predictor (architecture + loader)
-│   ├── fba_anchor.py        # COBRApy FBA wrapper
-│   └── pipeline.py          # End-to-end orchestration
-├── train/
-│   └── train_ogt.py         # Train + evaluate OGT MLP; saves artifacts
-├── examples/
-│   ├── example_pipeline.py  # Runnable demo (scenarios A and B)
-│   └── example_medium_ecoli.json
-├── models/                  # (not committed) -- place trained artifacts here
-│   ├── ogt_mlp/             # mlp.pkl  scaler.pkl  feature_cols.pkl
-│   └── tpc_pinn/            # checkpoint.pt  esm_scaler.pkl
-├── requirements.txt
-├── README.md
-└── READMECN.md
+Microbial-Growth-TPC-Predictor/
+|-- code/
+|   |-- core_model.py          Training script for the UDE TPC shape model
+|   |-- TPC_predictor.py       Main entry point: FASTA + medium -> absolute TPC
+|   |-- OGT_predictor.py       OGT MLP: training and inference from FASTA/CSV
+|   |-- FBA_anchor_point.py    CarveMe GEM reconstruction + COBRApy FBA
+|-- data/                      (empty -- place training data here locally)
+|-- results/
+|   |-- core_model_checkpoint.pt   Trained UDE weights
+|   |-- core_model_scaler.pkl      ESM embedding StandardScaler
+|   |-- ogt_mlp/
+|       |-- mlp.pkl                Trained OGT MLP
+|       |-- scaler.pkl             Feature StandardScaler
+|       |-- feature_cols.pkl       Ordered list of 526 feature names
+|       |-- cv_results.json        10-fold CV metrics
+|-- Train/
+|   |-- core_model_training_log.csv    Per-epoch losses
+|   |-- core_model_training_loss.png   Loss curve plot
+|   |-- ogt_mlp_cv_log.csv             Per-fold CV results
+|-- examples/
+|   |-- example_ecoli.py               E. coli K-12 MG1655 (mesophile)
+|   |-- example_thermus.py             T. thermophilus HB8 (thermophile)
+|   |-- example_medium_ecoli.json      M9 minimal medium for E. coli
+|   |-- example_medium_thermus.json    Defined medium for T. thermophilus
+|-- requirements.txt
+|-- README.md
+|-- READMECN.md
 ```
 
 ---
@@ -85,130 +100,144 @@ MGTP/
 pip install -r requirements.txt
 ```
 
-### 2. Train the OGT model
+For FBA support (optional):
 
 ```bash
-python train/train_ogt.py \
-    --bacteria_csv /path/to/calculated_features_bacteria.csv \
-    --archaea_csv  /path/to/calculated_features_archaea.csv \
-    --output_dir   models/ogt_mlp
+pip install cobra carveme
+# CarveMe also requires DIAMOND; see https://carveme.readthedocs.io
 ```
 
-This runs 10-fold CV, prints metrics, then trains a final model on all data
-and saves artifacts to `models/ogt_mlp/`.
+### 2. Prepare data and train models
 
-### 3. Place TPC PINN artifacts
-
-Copy the trained PINN checkpoint and scaler from Hybrid-TPC-Model:
+#### 2a. Train the OGT MLP
 
 ```bash
-cp Hybrid-TPC-Model/results/group4_pinn_checkpoint.pt  models/tpc_pinn/checkpoint.pt
-cp Hybrid-TPC-Model/results/group4_pinn_scaler.pkl     models/tpc_pinn/esm_scaler.pkl
+python code/OGT_predictor.py train \
+    --bacteria_csv data/calculated_features_bacteria.csv \
+    --archaea_csv  data/calculated_features_archaea.csv
 ```
 
-### 4. Run the pipeline (Python API)
+This runs 10-fold CV, prints metrics, trains a final model on all data, and saves
+artifacts to `results/ogt_mlp/` with CV logs in `Train/`.
+
+#### 2b. Train the core TPC shape model
+
+Place the TPC CSV (with pre-embedded ESM-2 columns) in `data/` then run:
+
+```bash
+python code/core_model.py --data data/11800TPC_1_1_with_medium_group_3_with_OGT.csv
+```
+
+Training saves `results/core_model_checkpoint.pt`, `results/core_model_scaler.pkl`,
+and logs/plots to `Train/`.
+
+### 3. Predict TPC from a genome FASTA
+
+**Normalised output (no FBA):**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --temp_min 5 --temp_max 80
+```
+
+**With FBA absolute scaling:**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --medium examples/example_medium_ecoli.json \
+    --temp_min 5 --temp_max 80
+```
+
+**Override OGT (skip OGT prediction):**
+
+```bash
+python code/TPC_predictor.py --fasta genome.fna --ogt 37.0
+```
+
+External tools required for full pipeline:
+- **Prodigal** (gene calling) -- https://github.com/hyattpd/Prodigal
+- **Barrnap** (rRNA detection) -- https://github.com/tseemann/barrnap
+- **ESM-2** -- `pip install fair-esm` or `pip install transformers`
+- **CarveMe** (GEM reconstruction, FBA only) -- `pip install carveme`
+
+### 4. Python API
 
 ```python
 import numpy as np
-import pandas as pd
-from mgtp import MGTPipeline
+import sys
+sys.path.insert(0, "code")
 
-# Load pipeline (without FBA)
-pipe = MGTPipeline(
-    ogt_model_dir = "models/ogt_mlp",
-    tpc_model_dir = "models/tpc_pinn",
-)
+from TPC_predictor import load_model, predict_shape
 
-# Predict TPC
-T, rate, ogt = pipe.predict(
-    esm_embedding     = esm_vec,          # ndarray, shape (emb_dim,)
-    genomic_features  = feature_df,       # DataFrame with 526 features
-    temperature_range = np.arange(5, 70, 1),
+model, scaler, meta, device = load_model()
+
+# esm_embedding: mean-pooled ESM-2 vector for the target proteome, shape (1280,)
+result = predict_shape(
+    model, scaler, meta, device,
+    esm_embedding = esm_embedding,
+    ogt_c         = 37.0,
+    temperatures  = np.arange(5, 75, 1),
 )
-print(f"Predicted OGT: {ogt:.1f} C")
-print(f"Peak normalised rate: {rate.max():.4f}")
+print(f"ToptC = {result['ToptC']:.1f} C")
+print(f"Peak at T = {result['temperatures'][result['pred_shape'].argmax()]:.0f} C")
 ```
 
-### 5. With FBA anchor
+---
 
-```python
-pipe = MGTPipeline(
-    ogt_model_dir  = "models/ogt_mlp",
-    tpc_model_dir  = "models/tpc_pinn",
-    fba_model_path = "models/iJO1366.xml",
-)
+## Run the examples
 
-medium = {
-    "EX_glc__D_e": 10.0,   # glucose
-    "EX_o2_e":     20.0,   # oxygen
-    "EX_nh4_e":    10.0,   # nitrogen
-}
+```bash
+# E. coli K-12 (mesophile, ~37 C)
+python examples/example_ecoli.py
 
-T, rate, ogt = pipe.predict(
-    esm_embedding    = esm_vec,
-    genomic_features = feature_df,
-    medium           = medium,
-    temperature_range = np.arange(5, 70, 1),
-)
-print(f"Peak growth rate (FBA): {rate.max():.4f} h-1")
+# Thermus thermophilus HB8 (thermophile, ~65 C)
+python examples/example_thermus.py
 ```
+
+Outputs are saved to `examples/output/`.
 
 ---
 
 ## Input specifications
 
-### Genomic features (526 columns)
-
-Computed per genome using the same pipeline as the training data.
-The exact column names are stored in `models/ogt_mlp/feature_cols.pkl`.
-
-Feature groups:
-
-| Group | Count |
-|---|---|
-| Genome size | 1 |
-| rRNA nucleotide fractions + MFE/len (5S / 16S / 23S) | 15 |
-| tRNA nucleotide fractions + MFE/len | 5 |
-| GC content (normalised) | 1 |
-| Proteome amino-acid fractions (raw + GC-normalised) | 40 |
-| Proteome properties (mean length, charge ratios) | 4 |
-| Codon usage (synonymous codon fractions) | 64 |
-| Dipeptide frequencies | 400 |
-
-### ESM embedding
-
-Mean-pooled output of ESM-2 (e.g. `facebook/esm2_t33_650M_UR50D`)
-over the organism's proteome. Dimension must match the value stored in
-`models/tpc_pinn/checkpoint.pt` (key: `emb_len`).
+### Genome FASTA
+Nucleotide genome FASTA (`.fna`) or amino-acid proteome FASTA (`.faa`).
+The pipeline detects the type automatically (>80% ACGTN = nucleotide).
 
 ### Medium (FBA)
+JSON dict mapping COBRA exchange-reaction IDs to maximum uptake rates
+(mmol gDW-1 h-1, positive values).  See `examples/example_medium_ecoli.json`
+for the E. coli M9 minimal medium.
 
-A dict mapping exchange-reaction IDs to maximum uptake rates
-(mmol gDW-1 h-1).  See `examples/example_medium_ecoli.json` for the
-M9 minimal-medium example for *E. coli* iJO1366.
+### Feature CSV (OGT training)
+One row per genome, one column per feature.  Must contain an `OGT` column.
+Column names must match those in `results/ogt_mlp/feature_cols.pkl`.
 
 ---
 
 ## OGT model performance
 
-| Split | RMSE (C) | MAE (C) | R2 |
-|---|---|---|---|
-| 10-fold CV overall | 5.12 | 3.91 | 0.87 |
-| Best fold | 4.58 | 3.50 | 0.92 |
-| Worst fold | 5.75 | 4.31 | 0.80 |
+| Split              | RMSE (C) | MAE (C) | R2   |
+|--------------------|----------|---------|------|
+| 10-fold CV overall | 5.12     | 3.91    | 0.87 |
+| Best fold          | 4.58     | 3.50    | 0.92 |
+| Worst fold         | 5.75     | 4.31    | 0.80 |
 
-Training set: 2 869 Bacteria + 262 Archaea (GTDB taxonomy).
+Training set: 2869 Bacteria + 262 Archaea (GTDB taxonomy).
 
 ---
 
 ## Citation
 
-If you use MGTP in your research, please cite:
+If you use this toolkit in your research, please cite:
 
-- The **Hybrid-TPC-Model** for the PINN/UDE architecture.
+- The **Hybrid-TPC-Model** for the UDE / UTPC architecture.
 - The source of the genomic feature data and OGT labels
-  (e.g. TEMPURA database, Engqvist 2018).
+  (e.g., TEMPURA database, Engqvist 2018).
 - COBRApy for FBA: Ebrahim et al. (2013) *BMC Systems Biology*.
+- ESM-2: Lin et al. (2023) *Science*.
 
 ---
 

@@ -11,8 +11,21 @@ build/
 venv/
 env/
 
-# Large metabolic model files (download separately)
-models/*.xml
+# Data files (large, not committed)
+data/*.csv
+data/*.tsv
+data/*.h5
+data/*.hdf5
+data/*.parquet
+
+# Intermediate temp directories created by tools
+_tmp_esm/
+_tmp_ogt/
+_tmp_fba/
+
+# GEM files (large, download separately)
+*.xml
+*.sbml
 
 # Jupyter
 .ipynb_checkpoints/
