@@ -131,33 +131,58 @@ python code/core_model.py --data data/11800TPC_1_1_with_medium_group_3_with_OGT.
 Training saves `results/core_model_checkpoint.pt`, `results/core_model_scaler.pkl`,
 and logs/plots to `Train/`.
 
-### 3. Predict TPC (Python API)
+### 3. Predict TPC from a genome FASTA
+
+**Normalised output (no FBA):**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --temp_min 5 --temp_max 80
+```
+
+**With FBA absolute scaling:**
+
+```bash
+python code/TPC_predictor.py \
+    --fasta  genome.fna \
+    --medium examples/example_medium_ecoli.json \
+    --temp_min 5 --temp_max 80
+```
+
+**Override OGT (skip OGT prediction):**
+
+```bash
+python code/TPC_predictor.py --fasta genome.fna --ogt 37.0
+```
+
+External tools required for full pipeline:
+- **Prodigal** (gene calling) -- https://github.com/hyattpd/Prodigal
+- **Barrnap** (rRNA detection) -- https://github.com/tseemann/barrnap
+- **ESM-2** -- `pip install fair-esm` or `pip install transformers`
+- **CarveMe** (GEM reconstruction, FBA only) -- `pip install carveme`
+
+### 4. Python API
 
 ```python
-import numpy as np, sys
+import numpy as np
+import sys
 sys.path.insert(0, "code")
-from TPC_predictor import load_model, predict_single
+
+from TPC_predictor import load_model, predict_shape
 
 model, scaler, meta, device = load_model()
 
-# esm_embedding: mean-pooled ESM-2 (esm2_t33_650M_UR50D) vector, shape (1280,)
-# ogt_c: predicted by OGT_predictor.py, or a known value
-result = predict_single(model, scaler, meta, device,
-                        esm_embedding = esm_embedding,
-                        ogt_c         = 37.0,
-                        temperatures  = np.arange(5, 75, 1))
+# esm_embedding: mean-pooled ESM-2 vector for the target proteome, shape (1280,)
+result = predict_shape(
+    model, scaler, meta, device,
+    esm_embedding = esm_embedding,
+    ogt_c         = 37.0,
+    temperatures  = np.arange(5, 75, 1),
+)
 print(f"ToptC = {result['ToptC']:.1f} C")
 print(f"Peak at T = {result['temperatures'][result['pred_shape'].argmax()]:.0f} C")
 ```
-
-### 4. Batch prediction from CSV
-
-```bash
-python code/TPC_predictor.py
-# Edit the __main__ block to call predict_from_csv() with your CSV path.
-```
-
-The CSV must contain columns: `TPC_id`, `temperature`, `OGT`, `esm2_0` ... `esm2_1279`.
 
 ---
 
@@ -177,10 +202,9 @@ Outputs are saved to `examples/output/`.
 
 ## Input specifications
 
-### ESM-2 embedding
-Mean-pooled output of ESM-2 (`facebook/esm2_t33_650M_UR50D`) over the organism's
-full proteome.  Embed each protein with ESM-2, average the per-residue representations
-across all residues, then average across all proteins to get a single 1280-dim vector.
+### Genome FASTA
+Nucleotide genome FASTA (`.fna`) or amino-acid proteome FASTA (`.faa`).
+The pipeline detects the type automatically (>80% ACGTN = nucleotide).
 
 ### Medium (FBA)
 JSON dict mapping COBRA exchange-reaction IDs to maximum uptake rates
