@@ -11,11 +11,7 @@ build/
 venv/
 env/
 
-# Trained model artifacts (large binary files — store separately or via Git LFS)
-models/ogt_mlp/*.pkl
-models/ogt_mlp/*.json
-models/tpc_pinn/*.pt
-models/tpc_pinn/*.pkl
+# Large metabolic model files (download separately)
 models/*.xml
 
 # Jupyter
