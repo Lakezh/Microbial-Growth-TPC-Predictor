@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
 """
-OGT_predictor.py  --  Train and apply the genomic-feature OGT MLP.
+OGT_predictor.py  --  Train and apply the proteome-feature OGT MLP.
 
-Predicts Optimal Growth Temperature (OGT) from a genome FASTA file by
-extracting 526 sequence-derived features and passing them through a
-multilayer perceptron (MLP) regressor.
+Predicts Optimal Growth Temperature (OGT) from a proteome FASTA file by
+extracting 425 amino-acid-sequence-derived features and passing them through
+a multilayer perceptron (MLP) regressor.
 
-Feature groups (526 total)
+Feature groups (425 total)
 --------------------------
-    Genome size                                             1
-    rRNA nucleotide composition + MFE/len (5S/16S/23S)    15
-    tRNA nucleotide composition + MFE/len                   5
-    Genome GC fraction                                      1
-    Proteome AA fractions (GC-normalised + raw)            40
-    Proteome properties (length, charge, stability ratios)  5
-    Codon usage in ORFs (59 codons, excluding stops/M/W)   59
-    Dipeptide frequencies (20x20)                         400
+    Raw amino acid fractions (20 AA)                         20
+    Proteome properties (mean length, charge, IVYWREL ratios) 5
+    Dipeptide frequencies (20x20)                           400
     ---------------------------------------------------------
-    Total                                                 526
+    Total                                                   425
 
-MFE features require ViennaRNA (RNAfold) on PATH; set to 0 if absent.
-Prodigal and Barrnap must be on PATH for FASTA-based prediction.
+All features are derived purely from the amino acid sequences in the
+proteome FASTA — no genome sequence, rRNA, tRNA, or codon data required.
 
 Modes
 -----
-    Train from pre-computed feature CSVs:
+    Train from pre-computed feature CSVs (protein-compatible columns only):
         python code/OGT_predictor.py train \\
             --bacteria_csv data/calculated_features_bacteria.csv \\
             --archaea_csv  data/calculated_features_archaea.csv
 
-    Predict OGT from a genome FASTA:
-        python code/OGT_predictor.py predict --fasta genome.fna
+    Predict OGT from a proteome FASTA:
+        python code/OGT_predictor.py predict --fasta proteome.faa
 
     Predict from a pre-computed feature CSV:
         python code/OGT_predictor.py predict --feature_csv features.csv
 """
 
-import sys, json, argparse, subprocess, warnings, pickle
+import sys, json, argparse, warnings, pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -69,6 +64,23 @@ META_COLS = {
     'family', 'genus', 'species', 'OGT'
 }
 
+# Columns derived from genome sequence / nucleotide data — not usable
+# when only a protein FASTA is provided.  These are excluded at training time
+# so the saved feature_cols.pkl lists only the 425 protein-level features.
+_GENOME_FEATURE_PATTERNS = (
+    'genome_size',       # nucleotide genome length
+    '5S_',               # 5S rRNA composition
+    '16S_',              # 16S rRNA composition
+    '23S_',              # 23S rRNA composition
+    'tRNA_',             # tRNA composition
+    'trna_',             # tRNA MFE
+    'G_fraction',        # genome GC content
+)
+_EXCLUDE_SUBSTRINGS = (
+    '_frac_normed',      # AA fraction / GC — requires genome GC
+    '_ORF_',             # codon usage in CDS — requires nucleotide CDS
+)
+
 # ============================================================
 # MLP hyperparameters  (mirrors Chapter2/OGT/Code/train_ogt_mlp.py)
 # ============================================================
@@ -90,57 +102,28 @@ MLP_PARAMS = dict(
 # ============================================================
 # Feature constants
 # ============================================================
-AA_ALPHABET = list('ACDEFGHIKLMNPQRSTVWY')  # 20 standard amino acids, sorted
+AA_ALPHABET = list('ACDEFGHIKLMNPQRSTVWY')   # 20 standard AAs, sorted
 
 DIPEPTIDE_COLS = [f'Pro_{a}{b}' for a in AA_ALPHABET for b in AA_ALPHABET]  # 400
 
-# Standard genetic code (used for codon-feature naming)
-_CODON_TO_AA = {
-    'TTT':'F','TTC':'F','TTA':'L','TTG':'L',
-    'CTT':'L','CTC':'L','CTA':'L','CTG':'L',
-    'ATT':'I','ATC':'I','ATA':'I','ATG':'M',
-    'GTT':'V','GTC':'V','GTA':'V','GTG':'V',
-    'TCT':'S','TCC':'S','TCA':'S','TCG':'S',
-    'CCT':'P','CCC':'P','CCA':'P','CCG':'P',
-    'ACT':'T','ACC':'T','ACA':'T','ACG':'T',
-    'GCT':'A','GCC':'A','GCA':'A','GCG':'A',
-    'TAT':'Y','TAC':'Y','TAA':'*','TAG':'*',
-    'CAT':'H','CAC':'H','CAA':'Q','CAG':'Q',
-    'AAT':'N','AAC':'N','AAA':'K','AAG':'K',
-    'GAT':'D','GAC':'D','GAA':'E','GAG':'E',
-    'TGT':'C','TGC':'C','TGA':'*','TGG':'W',
-    'CGT':'R','CGC':'R','CGA':'R','CGG':'R',
-    'AGT':'S','AGC':'S','AGA':'R','AGG':'R',
-    'GGT':'G','GGC':'G','GGA':'G','GGG':'G',
-}
 
-# 59 codon features in the exact CSV column order (stops + ATG + TGG excluded)
-_CODON_COL_ORDER = [
-    'AAA','AAT','AAG','AAC',
-    'ATA','ATT','ATC',
-    'AGA','AGT','AGG','AGC',
-    'ACA','ACT','ACG','ACC',
-    'TAT','TAC',
-    'TTA','TTT','TTG','TTC',
-    'TGT','TGC',
-    'TCA','TCT','TCG','TCC',
-    'GAA','GAT','GAG','GAC',
-    'GTA','GTT','GTG','GTC',
-    'GGA','GGT','GGG','GGC',
-    'GCA','GCT','GCG','GCC',
-    'CAA','CAT','CAG','CAC',
-    'CTA','CTT','CTG','CTC',
-    'CGA','CGT','CGG','CGC',
-    'CCA','CCT','CCG','CCC',
-]
-CODON_COLS = [f'{_CODON_TO_AA[c]}_ORF_{c}' for c in _CODON_COL_ORDER]  # 59
+def _is_protein_feature(col):
+    """Return True if col is a protein-derivable feature (not genome-level)."""
+    if col in META_COLS:
+        return False
+    if any(col.startswith(p) for p in _GENOME_FEATURE_PATTERNS):
+        return False
+    if any(s in col for s in _EXCLUDE_SUBSTRINGS):
+        return False
+    return True
+
 
 # ============================================================
 # Training
 # ============================================================
 
 def _load_training_data(bacteria_csv, archaea_csv):
-    """Merge the two feature CSVs; return X, y, feature_cols."""
+    """Merge the two feature CSVs; keep only 425 protein-level features."""
     frames = []
     for path, label in [(bacteria_csv, 'bacteria'), (archaea_csv, 'archaea')]:
         df = pd.read_csv(path)
@@ -151,7 +134,7 @@ def _load_training_data(bacteria_csv, archaea_csv):
     if 'OGT' not in df.columns:
         raise ValueError("'OGT' column not found in training CSV")
 
-    feature_cols = [c for c in df.columns if c not in META_COLS and c != '_domain']
+    feature_cols = [c for c in df.columns if _is_protein_feature(c) and c != '_domain']
     df['OGT'] = pd.to_numeric(df['OGT'], errors='coerce')
     df = df.dropna(subset=['OGT']).reset_index(drop=True)
 
@@ -232,14 +215,14 @@ def train_ogt_mlp(bacteria_csv, archaea_csv):
 def load_ogt_model(model_dir=None):
     """Load trained OGT MLP, scaler, and feature column list."""
     d = Path(model_dir) if model_dir else RESULTS_DIR
-    with open(d / 'mlp.pkl',          'rb') as fh: mlp   = pickle.load(fh)
-    with open(d / 'scaler.pkl',        'rb') as fh: scl   = pickle.load(fh)
-    with open(d / 'feature_cols.pkl',  'rb') as fh: cols  = pickle.load(fh)
+    with open(d / 'mlp.pkl',          'rb') as fh: mlp  = pickle.load(fh)
+    with open(d / 'scaler.pkl',        'rb') as fh: scl  = pickle.load(fh)
+    with open(d / 'feature_cols.pkl',  'rb') as fh: cols = pickle.load(fh)
     return mlp, scl, cols
 
 
 # ============================================================
-# Feature extraction from FASTA
+# Feature extraction from protein FASTA
 # ============================================================
 
 def _read_fasta(path):
@@ -257,142 +240,46 @@ def _read_fasta(path):
     return seqs
 
 
-def _is_nucleotide(path):
-    text = Path(path).read_text(errors='ignore').upper()
-    body = ''.join(l for l in text.splitlines() if not l.startswith('>'))
-    if not body: return True
-    return sum(body.count(c) for c in 'ACGTN') / len(body) > 0.80
-
-
-def _nuc_fracs(seq):
-    """Nucleotide A/T/G/C fractions of a sequence."""
-    seq = seq.upper().replace('U', 'T')
-    n = len(seq) or 1
-    return {nuc: seq.count(nuc) / n for nuc in 'ATGC'}
-
-
-def _run_rnafold(seq):
-    """Return MFE/len via ViennaRNA RNAfold; 0.0 if not available."""
-    try:
-        res = subprocess.run(['RNAfold', '--noPS'],
-                             input=seq, capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            return 0.0
-        # last line: structure (mfe)  -> "(((...))) (-12.34)"
-        last = res.stdout.strip().split('\n')[-1]
-        mfe = float(last.split('(')[-1].rstrip(')').strip())
-        return mfe / len(seq) if len(seq) > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def _run_barrnap(genome_fasta, tmp_dir):
-    """Run Barrnap; return dict {rna_type: [seq, ...]} for 5S/16S/23S and tRNA."""
-    tmp_dir = Path(tmp_dir)
-    rrna_out = tmp_dir / 'rrna.fna'
-    cmd = ['barrnap', '--quiet', '--outseq', str(rrna_out), str(genome_fasta)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not rrna_out.exists():
-        return {}
-    seqs = _read_fasta(rrna_out)
-    result = {'5S': [], '16S': [], '23S': [], 'tRNA': []}
-    for h, s in seqs:
-        h_up = h.upper()
-        for k in ('5S', '16S', '23S'):
-            if k in h_up:
-                result[k].append(s)
-                break
-        else:
-            if 'TRNA' in h_up:
-                result['tRNA'].append(s)
-    return result
-
-
-def _run_prodigal(genome_fasta, tmp_dir):
-    """Run Prodigal; return (protein_seqs, cds_seqs)."""
-    tmp_dir = Path(tmp_dir)
-    prot_out = tmp_dir / 'proteins.faa'
-    cds_out  = tmp_dir / 'cds.fna'
-    cmd = ['prodigal', '-i', str(genome_fasta),
-           '-a', str(prot_out), '-d', str(cds_out), '-p', 'meta', '-q']
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"Prodigal failed:\n{r.stderr}")
-    return _read_fasta(prot_out), _read_fasta(cds_out)
-
-
-def extract_genomic_features(genome_fasta, tmp_dir=None):
-    """Extract all 526 OGT-predictive features from a genome FASTA.
+def extract_protein_features(protein_fasta):
+    """Extract 425 OGT-predictive features from a proteome FASTA.
 
     Parameters
     ----------
-    genome_fasta : str or Path  -- nucleotide genome FASTA
-    tmp_dir      : working directory for Prodigal/Barrnap output
+    protein_fasta : str or Path  -- amino acid proteome FASTA
 
     Returns
     -------
     dict mapping feature_name -> float
     """
-    genome_fasta = Path(genome_fasta)
-    if tmp_dir is None:
-        tmp_dir = genome_fasta.parent / '_tmp_ogt'
-    Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+    seqs_raw  = _read_fasta(protein_fasta)
+    prot_seqs = [s.rstrip('*').upper() for _, s in seqs_raw]
 
-    # ---- Genome-level ----
-    contigs    = _read_fasta(genome_fasta)
-    genome_seq = ''.join(s for _, s in contigs).upper()
-    genome_size = float(len(genome_seq))
-    gc          = (genome_seq.count('G') + genome_seq.count('C')) / max(1, len(genome_seq))
+    if not prot_seqs:
+        raise ValueError(f"No sequences found in {protein_fasta}")
 
-    feats = {'genome_size': genome_size, 'G_fraction_normalized': gc}
-
-    # ---- rRNA features (Barrnap) ----
-    rrna = _run_barrnap(genome_fasta, tmp_dir)
-    for rna_type in ('5S', '16S', '23S'):
-        cat = ''.join(rrna.get(rna_type, [])).upper()
-        nf  = _nuc_fracs(cat)
-        for nuc in 'ATGC':
-            feats[f'{rna_type}_rRNA_{nuc}'] = nf[nuc]
-        feats[f'{rna_type}_mfe_len'] = _run_rnafold(cat) if cat else 0.0
-
-    # ---- tRNA features (Barrnap) ----
-    trna_cat = ''.join(rrna.get('tRNA', [])).upper()
-    tnf      = _nuc_fracs(trna_cat)
-    for nuc in 'ATGC':
-        feats[f'tRNA_{nuc}'] = tnf[nuc]
-    feats['trna_mfe_len'] = _run_rnafold(trna_cat) if trna_cat else 0.0
-
-    # ---- Proteome features (Prodigal) ----
-    prot_raw, cds_raw = _run_prodigal(genome_fasta, tmp_dir)
-    prot_seqs = [s.rstrip('*') for _, s in prot_raw]
-    cds_seqs  = [s for _, s in cds_raw]
-
-    concat_aa = ''.join(prot_seqs).upper()
+    concat_aa = ''.join(prot_seqs)
     n_aa = max(1, len(concat_aa))
 
-    # Raw AA fractions
-    aa_raw = {aa: concat_aa.count(aa) / n_aa for aa in AA_ALPHABET}
+    feats = {}
 
-    # GC-normalised AA fractions  (raw / gc)
-    for aa in AA_ALPHABET:
-        feats[f'Pro_{aa}_frac_normed'] = aa_raw[aa] / gc if gc > 0 else aa_raw[aa]
+    # Raw AA fractions (20)
+    aa_raw = {aa: concat_aa.count(aa) / n_aa for aa in AA_ALPHABET}
     for aa in AA_ALPHABET:
         feats[f'Pro_{aa}'] = aa_raw[aa]
 
-    # Proteome aggregate properties
-    feats['Pro_mean_length']      = float(np.mean([len(s) for s in prot_seqs])) if prot_seqs else 0.0
-    feats['Pro_polar_charged']    = sum(aa_raw[a] for a in 'DEKRH')
-    feats['Pro_polar_hydrophobic']= sum(aa_raw[a] for a in 'AVFILMWP')
+    # Proteome aggregate properties (5)
+    feats['Pro_mean_length']       = float(np.mean([len(s) for s in prot_seqs]))
+    feats['Pro_polar_charged']     = sum(aa_raw[a] for a in 'DEKRH')
+    feats['Pro_polar_hydrophobic'] = sum(aa_raw[a] for a in 'AVFILMWP')
     q  = aa_raw['Q'] or 1e-9
     qh = (aa_raw['Q'] + aa_raw['H']) or 1e-9
     feats['Pro_LK/Q']  = (aa_raw['L'] + aa_raw['K']) / q
     feats['Pro_EK/QH'] = (aa_raw['E'] + aa_raw['K']) / qh
 
-    # Dipeptide frequencies
+    # Dipeptide frequencies (400)
     dp_counts = {f'Pro_{a}{b}': 0 for a in AA_ALPHABET for b in AA_ALPHABET}
     dp_total  = 0
     for seq in prot_seqs:
-        seq = seq.upper()
         for i in range(len(seq) - 1):
             dp = f'Pro_{seq[i]}{seq[i+1]}'
             if dp in dp_counts:
@@ -401,21 +288,6 @@ def extract_genomic_features(genome_fasta, tmp_dir=None):
     n_dp = max(1, dp_total)
     for k in dp_counts:
         feats[k] = dp_counts[k] / n_dp
-
-    # Codon usage (59 codons, stops/M/W excluded)
-    _EXCLUDED = {'TAA', 'TAG', 'TGA', 'ATG', 'TGG'}
-    cod_counts = {c: 0 for c in _CODON_COL_ORDER}
-    cod_total  = 0
-    for cds in cds_seqs:
-        cds = cds.upper().replace('U', 'T')
-        for i in range(0, len(cds) - 2, 3):
-            codon = cds[i:i+3]
-            if codon in cod_counts:
-                cod_counts[codon] += 1
-                cod_total += 1
-    n_cod = max(1, cod_total)
-    for codon, count in cod_counts.items():
-        feats[f'{_CODON_TO_AA[codon]}_ORF_{codon}'] = count / n_cod
 
     return feats
 
@@ -437,25 +309,19 @@ def predict_ogt_from_features(feat_dict, model_dir=None):
     return float(mlp.predict(scl.transform(X))[0])
 
 
-def predict_ogt_from_fasta(fasta_path, model_dir=None, tmp_dir=None):
-    """Extract genomic features from a FASTA file and predict OGT.
+def predict_ogt_from_fasta(fasta_path, model_dir=None):
+    """Extract protein features from a proteome FASTA and predict OGT.
 
     Parameters
     ----------
-    fasta_path : str or Path -- genome FASTA (nucleotide)
+    fasta_path : str or Path -- proteome FASTA (amino acid sequences)
     model_dir  : path to results/ogt_mlp/ (uses default if None)
-    tmp_dir    : working directory for Prodigal/Barrnap output
 
     Returns
     -------
     float -- predicted OGT in degrees C
     """
-    fasta_path = Path(fasta_path)
-    if not _is_nucleotide(fasta_path):
-        raise ValueError(
-            f"{fasta_path} looks like a protein FASTA; OGT predictor requires "
-            "a nucleotide genome FASTA to extract rRNA and codon features.")
-    feats = extract_genomic_features(fasta_path, tmp_dir=tmp_dir)
+    feats = extract_protein_features(fasta_path)
     return predict_ogt_from_features(feats, model_dir=model_dir)
 
 
@@ -477,22 +343,20 @@ def predict_ogt_from_csv(feature_csv, model_dir=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='OGT predictor: train or predict from genomic sequence features')
+        description='OGT predictor: train or predict from proteome sequence features')
     sub = parser.add_subparsers(dest='mode', required=True)
 
     train_p = sub.add_parser('train', help='Train OGT MLP from feature CSVs')
     train_p.add_argument('--bacteria_csv', required=True, type=Path,
-                         help='CSV with 526 genomic features for bacteria')
+                         help='CSV with genomic features for bacteria (protein-compatible columns will be selected)')
     train_p.add_argument('--archaea_csv',  required=True, type=Path,
-                         help='CSV with 526 genomic features for archaea')
+                         help='CSV with genomic features for archaea (protein-compatible columns will be selected)')
 
-    pred_p = sub.add_parser('predict', help='Predict OGT from FASTA or feature CSV')
+    pred_p = sub.add_parser('predict', help='Predict OGT from proteome FASTA or feature CSV')
     grp = pred_p.add_mutually_exclusive_group(required=True)
-    grp.add_argument('--fasta',       type=Path, help='Genome FASTA file (nucleotide)')
-    grp.add_argument('--feature_csv', type=Path, help='Pre-computed 526-feature CSV')
+    grp.add_argument('--fasta',       type=Path, help='Proteome FASTA file (amino acid sequences)')
+    grp.add_argument('--feature_csv', type=Path, help='Pre-computed 425-feature CSV')
     pred_p.add_argument('--model_dir', type=Path, default=RESULTS_DIR)
-    pred_p.add_argument('--tmp_dir',   type=Path, default=None,
-                         help='Working directory for Prodigal/Barrnap output')
     pred_p.add_argument('--output',    type=Path, default=None,
                          help='Output CSV (batch mode only)')
 
@@ -503,9 +367,7 @@ if __name__ == '__main__':
 
     elif args.mode == 'predict':
         if args.fasta:
-            ogt = predict_ogt_from_fasta(args.fasta,
-                                         model_dir=args.model_dir,
-                                         tmp_dir=args.tmp_dir)
+            ogt = predict_ogt_from_fasta(args.fasta, model_dir=args.model_dir)
             print(f"Predicted OGT: {ogt:.1f} C")
         else:
             df_out = predict_ogt_from_csv(args.feature_csv, model_dir=args.model_dir)

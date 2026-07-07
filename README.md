@@ -9,29 +9,24 @@ and optionally scaled to absolute growth rates via FBA.
 ## How it works
 
 ```
-Genome FASTA
+Proteome FASTA (amino acid sequences)
     |
-    |---[Prodigal: gene calling]---> protein sequences
-    |       |
-    |       |--> ESM-2 mean-pooled embedding (1280-dim)
-    |                  |
-    |       +----------+----------+
-    |       |                     |
-    |  OGT_predictor          core_model (UDE)
-    |  sklearn MLP         ESMTempEncoder + UTPC ODE
-    |  (256-128-64)        + constrained residual
-    |       |                     |
-    |  OGT (C) <-- hard Topt      | normalised TPC shape (peak = 1)
-    |       |                     |
-    |       +----------+----------+
+    +---> 425 protein features
+    |     (AA fractions + proteome props + dipeptides)
+    |              |
+    |          OGT MLP (256-128-64)
+    |              |
+    |          OGT (C) <-- hard Topt anchor
     |
-    |---[CarveMe GEM reconstruction]
-    |           |
-    |    +-------+----------+
-    |    | FBA_anchor_point |  COBRApy FBA with user-defined medium
-    |    +-------+----------+
-    |            | peak growth rate (h-1)
-    |
+    +---> ESM-2 mean-pooled embedding (1280-dim)
+    |              |
+    |       core_model (UDE/UTPC)
+    |       ESMTempEncoder + UTPC ODE + constrained residual
+    |              |
+    |       normalised TPC shape (peak = 1)
+    |              |
+    |  [optional] CarveMe GEM + COBRApy FBA --> peak growth rate (h-1)
+    |              |
     Absolute TPC(T) = normalised_shape(T) x peak_rate
 ```
 
@@ -42,24 +37,21 @@ Genome FASTA
 ### Stage 1 — OGT prediction (`OGT_predictor.py`)
 
 The optimal growth temperature (OGT) is predicted by a **multilayer perceptron (MLP)**
-trained on **526 genomic sequence features** extracted from 3131 genomes
+trained on **425 protein-sequence-derived features** from 3131 genomes
 (2869 Bacteria + 262 Archaea, GTDB taxonomy).
+All features are derived directly from the amino acid sequences, so only a proteome
+FASTA is required — no genome sequence, rRNA, tRNA, or codon data.
 
-**Feature groups (526 total):**
+**Feature groups (425 total):**
 
 | Feature group | Dimensions |
 |---|---|
-| Genome size | 1 |
-| rRNA nucleotide composition + MFE/len (5S / 16S / 23S) | 15 |
-| tRNA nucleotide composition + MFE/len | 5 |
-| Genome GC fraction | 1 |
-| Proteome AA fractions (GC-normalised + raw) | 40 |
-| Proteome properties (mean length, charge ratios, stability indices) | 5 |
-| Codon usage in ORFs (59 codons, excluding stops / Met / Trp) | 59 |
+| Raw amino acid fractions (20 AAs) | 20 |
+| Proteome properties (mean length, charged/hydrophobic fractions, IVYWREL ratios) | 5 |
 | Dipeptide frequencies (20 × 20) | 400 |
 
 **Architecture:** hidden layers (256, 128, 64), ReLU, Adam, adaptive LR, early stopping.  
-**10-fold CV (n = 3131):** RMSE 5.12 °C | MAE 3.91 °C | R² 0.87
+**10-fold CV (n = 3131):** RMSE 5.17 °C | MAE 3.95 °C | R² 0.86
 
 ### Stage 2 — TPC shape prediction (`core_model.py` + `TPC_predictor.py`)
 
@@ -133,16 +125,17 @@ Key contents:
 - Neural network classes (identical to `core_model.py`, required for weight loading).
 
 ### `code/OGT_predictor.py`
-Trains and applies the OGT MLP from 526 genomic sequence features.
+Trains and applies the OGT MLP from 425 protein-sequence-derived features.
 
 Key contents:
-- `train_ogt_mlp(bacteria_csv, archaea_csv)` — 10-fold CV then final fit; saves
+- `train_ogt_mlp(bacteria_csv, archaea_csv)` — 10-fold CV then final fit; automatically
+  selects the 425 protein-compatible columns from the input CSVs; saves
   `results/ogt_mlp/mlp.pkl`, `scaler.pkl`, `feature_cols.pkl`, `cv_results.json`.
-- `extract_genomic_features(genome_fasta, tmp_dir)` — calls Prodigal and Barrnap to
-  extract protein, CDS, and rRNA sequences, then computes all 526 features.
-- `predict_ogt_from_fasta(fasta_path, model_dir)` — end-to-end: FASTA → features → OGT.
+- `extract_protein_features(protein_fasta)` — reads a proteome FASTA and computes
+  all 425 features (AA fractions, proteome properties, dipeptide frequencies).
+- `predict_ogt_from_fasta(fasta_path, model_dir)` — end-to-end: proteome FASTA → features → OGT.
 - `predict_ogt_from_csv(feature_csv, model_dir)` — batch OGT prediction from a
-  pre-computed 526-feature CSV.
+  pre-computed 425-feature CSV.
 
 ### `code/FBA_anchor_point.py`
 Genome-scale metabolic model reconstruction and FBA.
@@ -176,8 +169,8 @@ Pre-trained model artifacts committed to the repository:
   n_patches, t_mean_k, t_std_k, esm_cols, hyperparams).
 - `core_model_scaler.pkl` — `sklearn.StandardScaler` fitted on the ESM embeddings.
 - `ogt_mlp/mlp.pkl` — final OGT MLP fitted on all 3131 genomes.
-- `ogt_mlp/scaler.pkl` — `StandardScaler` fitted on the 526 features.
-- `ogt_mlp/feature_cols.pkl` — ordered list of the 526 feature column names.
+- `ogt_mlp/scaler.pkl` — `StandardScaler` fitted on the 425 features.
+- `ogt_mlp/feature_cols.pkl` — ordered list of the 425 protein-level feature column names.
 - `ogt_mlp/cv_results.json` — 10-fold CV metrics per fold.
 
 ### `Train/`
@@ -202,37 +195,35 @@ pip install -r requirements.txt
 pip install fair-esm          # Facebook's official library (recommended)
 # or:  pip install transformers
 
-# For gene calling (requires a Linux/Mac environment or WSL):
-# Prodigal: https://github.com/hyattpd/Prodigal
-
 # For FBA (optional):
 pip install cobra carveme
 ```
 
-### Step 1 — Download the genome
+### Step 1 — Download the proteome
 
-Download the *E. coli* K-12 MG1655 genome from NCBI RefSeq:
+Download the *E. coli* K-12 MG1655 proteome from NCBI RefSeq:
 
 ```
 Accession: GCF_000005845.2
-File:      GCF_000005845.2_ASM584v2_genomic.fna
+File:      GCF_000005845.2_ASM584v2_protein.faa
 ```
 
 ```bash
 # Using NCBI datasets CLI (https://www.ncbi.nlm.nih.gov/datasets/):
-datasets download genome accession GCF_000005845.2 --include genome
+datasets download genome accession GCF_000005845.2 --include protein
 unzip ncbi_dataset.zip
-# genome FASTA is at: ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna
+# proteome FASTA is at: ncbi_dataset/data/GCF_000005845.2/protein.faa
 ```
 
-### Step 2 — Predict OGT from genomic sequence features
+### Step 2 — Predict OGT from proteome features
 
-Extract 526 sequence-derived features (rRNA composition, proteome statistics, codon usage,
-dipeptides) and predict OGT using the trained MLP. Requires Prodigal and Barrnap on PATH.
+Extract 425 amino-acid-sequence features (AA fractions, dipeptides, proteome properties)
+and predict OGT using the trained MLP. Only a protein FASTA is required — no genome or
+gene-calling tools needed.
 
 ```bash
 python code/OGT_predictor.py predict \
-    --fasta ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna \
+    --fasta ncbi_dataset/data/GCF_000005845.2/protein.faa \
     --model_dir results/ogt_mlp
 ```
 
@@ -241,21 +232,12 @@ Expected output:
 Predicted OGT: 36.8 C
 ```
 
-> If Prodigal or Barrnap are not available, supply the known OGT directly in Step 4
-> using `--ogt 37.0`.
+> If you already know the OGT, you can skip this step and pass `--ogt 37.0` directly in
+> Step 4.
 
 ### Step 3 — Compute ESM-2 proteome embedding
 
-First, extract protein sequences with Prodigal:
-
-```bash
-prodigal \
-    -i ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna \
-    -a ecoli_proteins.faa \
-    -p single -q
-```
-
-Then embed all proteins with ESM-2 and mean-pool:
+Embed all proteins with ESM-2 and mean-pool (same proteome FASTA as Step 2):
 
 ```python
 import esm, torch, numpy as np
@@ -266,7 +248,7 @@ batch_converter = alphabet.get_batch_converter()
 
 # Read protein sequences
 seqs = []
-with open("ecoli_proteins.faa") as f:
+with open("ncbi_dataset/data/GCF_000005845.2/protein.faa") as f:
     h, s = "", ""
     for line in f:
         line = line.strip()
@@ -390,8 +372,9 @@ python examples/example_ecoli.py
 
 ### Retrain the OGT MLP
 
-Prepare two CSVs — one for Bacteria, one for Archaea — each containing the 526 genomic
-feature columns and an `OGT` column (degrees C):
+Prepare two CSVs — one for Bacteria, one for Archaea — each containing genomic feature
+columns and an `OGT` column (degrees C). The script automatically selects only the
+425 protein-compatible columns (genome-level and codon-usage columns are dropped):
 
 ```bash
 python code/OGT_predictor.py train \
@@ -418,11 +401,11 @@ Artifacts saved to `results/`. Training log and loss plot saved to `Train/`.
 
 | Split              | RMSE (°C) | MAE (°C) | R²   |
 |--------------------|-----------|----------|------|
-| 10-fold CV overall | 5.12      | 3.91     | 0.87 |
-| Best fold          | 4.58      | 3.50     | 0.92 |
-| Worst fold         | 5.75      | 4.31     | 0.80 |
+| 10-fold CV overall | 5.17      | 3.95     | 0.86 |
+| Best fold          | 4.82      | 3.54     | 0.89 |
+| Worst fold         | 5.76      | 4.34     | 0.81 |
 
-Training set: 2869 Bacteria + 262 Archaea (GTDB taxonomy), 526 genomic sequence features.
+Training set: 2869 Bacteria + 262 Archaea (GTDB taxonomy), 425 protein-sequence features.
 
 ---
 

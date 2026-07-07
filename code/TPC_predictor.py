@@ -3,10 +3,10 @@
 TPC_predictor.py  --  Main prediction pipeline for microbial Temperature-Performance Curves.
 
 Input:
-    --fasta        Genome FASTA (nucleotide) or proteome FASTA (amino acid)
+    --fasta        Proteome FASTA (amino acid sequences)
     --medium       JSON file mapping exchange-reaction IDs to uptake rates (for FBA)
     --temp_min/max/step  Temperature range to predict (default 5-80 step 1 C)
-    --ogt          Override OGT (C). If omitted, predicted from genomic sequence features.
+    --ogt          Override OGT (C). If omitted, predicted from proteome sequence features.
     --output       Output CSV path (default: tpc_prediction.csv)
 
 Output:
@@ -15,30 +15,32 @@ Output:
 
 Pipeline
 --------
-    Genome FASTA
+    Proteome FASTA (amino acid sequences)
      |
-     |--[Prodigal + Barrnap]--> 526 genomic features --> OGT MLP --> OGT (C)
+     |---> 425 protein features (AA fractions + dipeptides + proteome props)
+     |              |
+     |          OGT MLP --> OGT (C)
      |
-     |--[Prodigal]-----------> protein seqs --> ESM-2 embedding (1280-dim)
-                                              |
-                                    core_model (UDE/UTPC)  +  OGT anchor
-                                              |
-                                    normalised TPC shape (peak = 1)
-                                              |
-                          [optional] CarveMe GEM + COBRApy FBA --> peak growth rate
-                                              |
-                                    absolute TPC = shape x peak_rate
+     |---> ESM-2 mean-pooled embedding (1280-dim)
+     |              |
+     |       core_model (UDE/UTPC)  +  OGT anchor
+     |              |
+     |       normalised TPC shape (peak = 1)
+     |              |
+     |  [optional] CarveMe GEM + COBRApy FBA --> peak growth rate
+     |              |
+     |      absolute TPC = shape x peak_rate
 
 Usage examples
 --------------
     # Minimal: normalised TPC only
-    python code/TPC_predictor.py --fasta genome.fna
+    python code/TPC_predictor.py --fasta proteome.faa
 
     # With FBA absolute scaling
-    python code/TPC_predictor.py --fasta genome.fna --medium examples/example_medium_ecoli.json
+    python code/TPC_predictor.py --fasta proteome.faa --medium examples/example_medium_ecoli.json
 
     # Override OGT manually
-    python code/TPC_predictor.py --fasta genome.fna --ogt 37.0
+    python code/TPC_predictor.py --fasta proteome.faa --ogt 37.0
 """
 
 import math, pickle, warnings, argparse, subprocess, json, sys, os
@@ -360,10 +362,10 @@ def extract_esm_embedding(fasta_path, tmp_dir=None, max_proteins=2000):
         tmp_dir = fasta_path.parent / "_tmp_esm"
 
     if is_nucleotide_fasta(fasta_path):
-        print("[ESM] Nucleotide FASTA detected, running Prodigal for gene calling ...")
+        print("[ESM] Nucleotide FASTA detected, running Prodigal for gene prediction ...")
         protein_fasta = call_prodigal(fasta_path, tmp_dir)
     else:
-        protein_fasta = fasta_path
+        protein_fasta = fasta_path  # already a proteome FASTA
 
     seqs = read_fasta(protein_fasta)
     if not seqs:
@@ -497,13 +499,12 @@ def run_pipeline(fasta_path, temperatures, ogt_c=None, medium=None,
     esm_emb = extract_esm_embedding(fasta_path, tmp_dir=tmp_dir)
 
     if ogt_c is None:
-        print("[OGT] Predicting OGT from genomic sequence features ...")
+        print("[OGT] Predicting OGT from proteome sequence features ...")
         try:
             from OGT_predictor import predict_ogt_from_fasta
             ogt_c = predict_ogt_from_fasta(
                 fasta_path,
                 model_dir=RESULTS_DIR / "ogt_mlp",
-                tmp_dir=tmp_dir,
             )
             print(f"[OGT] Predicted OGT = {ogt_c:.1f} C")
         except Exception as exc:
@@ -544,11 +545,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Predict microbial Temperature-Performance Curve from FASTA")
     parser.add_argument("--fasta",     required=True,  type=Path,
-                        help="Genome FASTA (nucleotide) or proteome FASTA (amino acid)")
+                        help="Proteome FASTA (amino acid sequences)")
     parser.add_argument("--medium",    default=None,   type=Path,
                         help="JSON file with exchange reaction IDs and uptake rates for FBA")
     parser.add_argument("--ogt",       default=None,   type=float,
-                        help="Override OGT (C). If omitted, predicted from genomic features.")
+                        help="Override OGT (C). If omitted, predicted from proteome features.")
     parser.add_argument("--temp_min",  default=5.0,    type=float, help="Min temperature (C)")
     parser.add_argument("--temp_max",  default=80.0,   type=float, help="Max temperature (C)")
     parser.add_argument("--temp_step", default=1.0,    type=float, help="Temperature step (C)")
