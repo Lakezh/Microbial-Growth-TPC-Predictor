@@ -14,20 +14,16 @@ Genome FASTA
     |---[Prodigal: gene calling]---> protein sequences
     |       |
     |       |--> ESM-2 mean-pooled embedding (1280-dim)
-    |       |          |
-    |       |    +-----+-------------------------------+
-    |       |    |   core_model  (UDE)                 |
-    |       |    |   ESMTempEncoder + UTPC ODE physics  |
-    |       |    |   + constrained residual correction  |
-    |       |    +-----+-------------------------------+
-    |       |          | normalised TPC shape (peak = 1)
-    |       |          v
-    |       +--> codon / AA / dipeptide features (526-dim)
     |                  |
-    |            +-----+----------+
-    |            |  OGT_predictor |  sklearn MLP (256-128-64)
-    |            +-----+----------+
-    |                  | OGT (C)  <-- hard-anchors Topt in UTPC
+    |       +----------+----------+
+    |       |                     |
+    |  OGT_predictor          core_model (UDE)
+    |  sklearn MLP         ESMTempEncoder + UTPC ODE
+    |  (256-128-64)        + constrained residual
+    |       |                     |
+    |  OGT (C) <-- hard Topt      | normalised TPC shape (peak = 1)
+    |       |                     |
+    |       +----------+----------+
     |
     |---[CarveMe GEM reconstruction]
     |           |
@@ -46,24 +42,17 @@ Genome FASTA
 ### Stage 1 — OGT prediction (`OGT_predictor.py`)
 
 The optimal growth temperature (OGT) is predicted by a **multilayer perceptron (MLP)**
-trained on 526 genomic features extracted from 3131 genomes (2869 Bacteria + 262 Archaea,
-GTDB taxonomy).
+that takes the same **mean-pooled ESM-2 proteome embedding (1280-dim)** as input — the
+identical representation used by the TPC shape model. This means the embedding is computed
+only once per genome and reused for both OGT prediction and TPC shape prediction.
 
-**Feature groups (526 total):**
+Recent literature shows that proteome-level ESM-2 embeddings outperform hand-crafted
+genomic features (rRNA GC, amino-acid composition, dipeptides) for OGT regression,
+reaching RMSE ≈ 3.5–4.2 °C versus ≈ 4.5–5.5 °C for feature-engineering baselines.
 
-| Feature group | Dimensions |
-|---|---|
-| Genome size | 1 |
-| rRNA nucleotide fractions + MFE/len (5S / 16S / 23S) | 15 |
-| tRNA nucleotide fractions + MFE/len | 5 |
-| Genomic GC content | 1 |
-| Proteome amino-acid fractions (raw + GC-normalised) | 40 |
-| Proteome properties (mean length, charge ratios) | 4 |
-| Codon usage (synonymous codon fractions) | 64 |
-| Dipeptide frequencies | 400 |
-
-**Architecture:** hidden layers (256, 128, 64), ReLU, Adam, early stopping.
-**CV performance (10-fold, n = 3131):** RMSE 5.12 C | MAE 3.91 C | R2 0.87
+**Architecture:** hidden layers (256, 128, 64), ReLU, Adam, early stopping.  
+**Input:** ESM-2 mean-pooled proteome embedding (1280-dim).  
+**Training CSV format:** must contain columns `esm2_0 … esm2_1279` plus an `OGT` column.
 
 ### Stage 2 — TPC shape prediction (`core_model.py` + `TPC_predictor.py`)
 
@@ -137,16 +126,17 @@ Key contents:
 - Neural network classes (identical to `core_model.py`, required for weight loading).
 
 ### `code/OGT_predictor.py`
-Trains and applies the OGT MLP from 526 genomic features.
+Trains and applies the OGT MLP from ESM-2 proteome embeddings.
 
 Key contents:
-- `train_ogt_mlp(bacteria_csv, archaea_csv)` — 10-fold CV then final fit; saves
-  `results/ogt_mlp/mlp.pkl`, `scaler.pkl`, `feature_cols.pkl`, `cv_results.json`.
-- `extract_genomic_features(genome_fasta, tmp_dir)` — calls Prodigal and Barrnap to
-  extract protein sequences and rRNA sequences, then computes all 526 features.
-- `predict_ogt_from_fasta(fasta_path, model_dir)` — end-to-end: FASTA → features → OGT.
-- `predict_ogt_from_csv(feature_csv, model_dir)` — batch OGT prediction from a
-  pre-computed feature CSV.
+- `train_ogt_mlp(data_csv)` — 10-fold CV then final fit on a CSV containing
+  `esm2_0…esm2_1279` + `OGT` columns; saves `results/ogt_mlp/mlp.pkl`, `scaler.pkl`,
+  `cv_results.json`.
+- `predict_ogt_from_embedding(esm_embedding, model_dir)` — predict OGT directly from a
+  pre-computed 1280-dim ESM-2 array (no file I/O; used by `TPC_predictor.py` to avoid
+  computing the embedding twice).
+- `predict_ogt_from_fasta(fasta_path, model_dir)` — end-to-end: FASTA → ESM-2 → OGT.
+  Internally calls Prodigal for nucleotide input, then ESM-2 mean pooling.
 
 ### `code/FBA_anchor_point.py`
 Genome-scale metabolic model reconstruction and FBA.
@@ -179,9 +169,8 @@ Pre-trained model artifacts committed to the repository:
 - `core_model_checkpoint.pt` — UDE encoder/head/residual weights + metadata (emb_len,
   n_patches, t_mean_k, t_std_k, esm_cols, hyperparams).
 - `core_model_scaler.pkl` — `sklearn.StandardScaler` fitted on the ESM embeddings.
-- `ogt_mlp/mlp.pkl` — final OGT MLP fitted on all 3131 genomes.
-- `ogt_mlp/scaler.pkl` — `StandardScaler` fitted on the 526 features.
-- `ogt_mlp/feature_cols.pkl` — ordered list of the 526 feature column names.
+- `ogt_mlp/mlp.pkl` — final OGT MLP fitted on ESM-2 embeddings.
+- `ogt_mlp/scaler.pkl` — `StandardScaler` fitted on the 1280-dim ESM embeddings.
 - `ogt_mlp/cv_results.json` — 10-fold CV metrics per fold.
 
 ### `Train/`
@@ -208,7 +197,6 @@ pip install fair-esm          # Facebook's official library (recommended)
 
 # For gene calling (requires a Linux/Mac environment or WSL):
 # Prodigal: https://github.com/hyattpd/Prodigal
-# Barrnap:  https://github.com/tseemann/barrnap
 
 # For FBA (optional):
 pip install cobra carveme
@@ -230,9 +218,10 @@ unzip ncbi_dataset.zip
 # genome FASTA is at: ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna
 ```
 
-### Step 2 — Predict OGT from genomic features
+### Step 2 — Predict OGT from ESM-2 embedding
 
-Extract 526 genomic features and predict OGT using the trained MLP:
+The OGT MLP uses the same ESM-2 proteome embedding as the TPC model, so the embedding
+is computed once and shared. You can predict OGT directly from the FASTA:
 
 ```bash
 python code/OGT_predictor.py predict \
@@ -242,11 +231,18 @@ python code/OGT_predictor.py predict \
 
 Expected output:
 ```
+[OGT/ESM] Nucleotide FASTA -- running Prodigal ...
+[OGT/ESM] Embedding 4321 proteins with ESM-2 ...
 Predicted OGT: 36.8 C
 ```
 
-> If Prodigal or Barrnap are not available, you can supply the known OGT directly
-> in Step 4 using `--ogt 37.0`.
+Or if you have the ESM embedding already saved (e.g. from Step 3):
+
+```bash
+python code/OGT_predictor.py predict --embedding ecoli_esm_embedding.npy
+```
+
+> If Prodigal is not available, supply the known OGT directly in Step 4 via `--ogt 37.0`.
 
 ### Step 3 — Compute ESM-2 proteome embedding
 
@@ -394,13 +390,12 @@ python examples/example_ecoli.py
 
 ### Retrain the OGT MLP
 
-Prepare two CSV files — one for Bacteria, one for Archaea — each with 526 feature columns
-and an `OGT` column (degrees C):
+Prepare a single CSV containing the ESM-2 embedding columns `esm2_0 … esm2_1279` and
+an `OGT` column (degrees C). The TPC dataset CSV already has this format and can be
+used directly:
 
 ```bash
-python code/OGT_predictor.py train \
-    --bacteria_csv data/calculated_features_bacteria.csv \
-    --archaea_csv  data/calculated_features_archaea.csv
+python code/OGT_predictor.py train --data data/your_tpc_dataset.csv
 ```
 
 Artifacts saved to `results/ogt_mlp/`. Training log saved to `Train/ogt_mlp_cv_log.csv`.
@@ -420,13 +415,12 @@ Artifacts saved to `results/`. Training log and loss plot saved to `Train/`.
 
 ## OGT model performance
 
-| Split              | RMSE (C) | MAE (C) | R2   |
-|--------------------|----------|---------|------|
-| 10-fold CV overall | 5.12     | 3.91    | 0.87 |
-| Best fold          | 4.58     | 3.50    | 0.92 |
-| Worst fold         | 5.75     | 4.31    | 0.80 |
+Performance will be updated after retraining on the ESM-2 embedding input.
+Expected RMSE: 3.5–4.5 °C based on recent literature using proteome-level ESM embeddings.
 
-Training set: 2869 Bacteria + 262 Archaea (GTDB taxonomy).
+The pre-trained `results/ogt_mlp/mlp.pkl` was trained on ESM-2 embeddings from the
+TPC dataset organisms; run `python code/OGT_predictor.py train --data <csv>` to retrain
+on your own dataset.
 
 ---
 

@@ -6,7 +6,7 @@ Input:
     --fasta        Genome FASTA (nucleotide) or proteome FASTA (amino acid)
     --medium       JSON file mapping exchange-reaction IDs to uptake rates (for FBA)
     --temp_min/max/step  Temperature range to predict (default 5-80 step 1 C)
-    --ogt          Override OGT (C). If omitted, predicted from genomic features.
+    --ogt          Override OGT (C). If omitted, predicted from ESM-2 embedding.
     --output       Output CSV path (default: tpc_prediction.csv)
 
 Output:
@@ -17,9 +17,12 @@ Pipeline
 --------
     FASTA
      |--[Prodigal: gene calling]---> protein seqs --> ESM-2 embedding (1280-dim)
-     |--[Barrnap + sequence stats]--> 526 genomic features --> OGT MLP --> OGT (C)
                                               |
-                          ESM embedding + OGT --> core_model --> normalised TPC shape
+                              +--------------+---------------+
+                              |                              |
+                         OGT MLP --> OGT (C)      core_model (UDE/UTPC)
+                              |                              |
+                              +--------> normalised TPC shape (peak = 1)
                                               |
                           [optional] CarveMe GEM + COBRApy FBA --> peak growth rate
                                               |
@@ -493,13 +496,12 @@ def run_pipeline(fasta_path, temperatures, ogt_c=None, medium=None,
     esm_emb = extract_esm_embedding(fasta_path, tmp_dir=tmp_dir)
 
     if ogt_c is None:
-        print("[OGT] Predicting OGT from genomic features ...")
+        print("[OGT] Predicting OGT from ESM-2 embedding ...")
         try:
-            from OGT_predictor import predict_ogt_from_fasta
-            ogt_c = predict_ogt_from_fasta(
-                fasta_path,
+            from OGT_predictor import predict_ogt_from_embedding
+            ogt_c = predict_ogt_from_embedding(
+                esm_emb,
                 model_dir=RESULTS_DIR / "ogt_mlp",
-                tmp_dir=tmp_dir
             )
             print(f"[OGT] Predicted OGT = {ogt_c:.1f} C")
         except Exception as exc:

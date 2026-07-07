@@ -13,20 +13,16 @@
     |---[Prodigal 基因预测]---> 蛋白质序列
     |       |
     |       |--> ESM-2 均值池化嵌入向量（1280 维）
-    |       |          |
-    |       |    +-----+-----------------------------+
-    |       |    |   core_model（UDE 模型）            |
-    |       |    |   ESM 编码器 + UTPC ODE 物理约束    |
-    |       |    |   + 约束残差 MLP 修正              |
-    |       |    +-----+-----------------------------+
-    |       |          | 归一化 TPC 曲线形状（峰值 = 1）
-    |       |          v
-    |       +--> 密码子 / 氨基酸 / 二肽特征（526 维）
     |                  |
-    |            +-----+----------+
-    |            |  OGT_predictor |  sklearn MLP（256-128-64）
-    |            +-----+----------+
-    |                  | OGT（°C）<-- 硬锚定 UTPC 中的 Topt
+    |       +----------+----------+
+    |       |                     |
+    |  OGT_predictor          core_model（UDE）
+    |  sklearn MLP          ESM 编码器 + UTPC ODE
+    |  （256-128-64）        + 约束残差 MLP
+    |       |                     |
+    |  OGT（°C）<-- 硬锚定 Topt    | 归一化 TPC 形状（峰值=1）
+    |       |                     |
+    |       +----------+----------+
     |
     |---[CarveMe GEM 重建]
     |           |
@@ -44,24 +40,16 @@
 
 ### 第一阶段 — OGT 预测（`OGT_predictor.py`）
 
-最适生长温度（OGT）由**多层感知机（MLP）**预测，训练数据来自
-3131 个基因组（2869 细菌 + 262 古菌，GTDB 分类），提取 526 维基因组特征。
+最适生长温度（OGT）由**多层感知机（MLP）**预测，输入为与 TPC 形状模型完全相同的
+**ESM-2 蛋白质组均值池化嵌入向量（1280 维）**。这意味着嵌入只需计算一次，即可同时用于
+OGT 预测和 TPC 形状预测，无需重复运行 ESM-2。
 
-**特征组成（共 526 维）：**
-
-| 特征组 | 维数 |
-|---|---|
-| 基因组大小 | 1 |
-| rRNA 核苷酸比例 + MFE/len（5S / 16S / 23S） | 15 |
-| tRNA 核苷酸比例 + MFE/len | 5 |
-| 基因组 GC 含量 | 1 |
-| 蛋白质组氨基酸比例（原始 + GC 归一化） | 40 |
-| 蛋白质组属性（均值长度、电荷比例） | 4 |
-| 密码子使用频率（同义密码子分布） | 64 |
-| 二肽频率 | 400 |
+近年文献表明，基于蛋白质组 ESM-2 嵌入的 OGT 回归效果优于传统手工特征（rRNA GC、
+氨基酸组成、二肽频率等），预期 RMSE 约 3.5–4.2°C，而特征工程方案约为 4.5–5.5°C。
 
 **架构：** 隐藏层 (256, 128, 64)，ReLU，Adam，早停。  
-**10 折交叉验证（n=3131）：** RMSE 5.12°C | MAE 3.91°C | R2 0.87
+**输入：** ESM-2 均值池化蛋白质组嵌入（1280 维）。  
+**训练 CSV 格式：** 需包含 `esm2_0 … esm2_1279` 列及 `OGT` 列（单位 °C）。
 
 ### 第二阶段 — TPC 形状预测（`core_model.py` + `TPC_predictor.py`）
 
@@ -130,15 +118,15 @@ UDE TPC 形状模型的训练脚本。
 - 神经网络类（与 `core_model.py` 完全一致，加载权重所需）。
 
 ### `code/OGT_predictor.py`
-从 526 维基因组特征训练和应用 OGT MLP。
+从 ESM-2 蛋白质组嵌入向量训练和应用 OGT MLP。
 
 主要内容：
-- `train_ogt_mlp(bacteria_csv, archaea_csv)` — 10 折交叉验证后训练最终模型；保存
-  `results/ogt_mlp/mlp.pkl`、`scaler.pkl`、`feature_cols.pkl`、`cv_results.json`。
-- `extract_genomic_features(genome_fasta, tmp_dir)` — 调用 Prodigal 和 Barrnap 提取
-  蛋白质序列及 rRNA 序列，计算全部 526 个特征。
-- `predict_ogt_from_fasta(fasta_path, model_dir)` — 端到端：FASTA → 特征 → OGT。
-- `predict_ogt_from_csv(feature_csv, model_dir)` — 从预计算特征 CSV 批量预测 OGT。
+- `train_ogt_mlp(data_csv)` — 10 折交叉验证后训练最终模型；CSV 需含
+  `esm2_0…esm2_1279` + `OGT` 列；保存 `results/ogt_mlp/mlp.pkl`、`scaler.pkl`、`cv_results.json`。
+- `predict_ogt_from_embedding(esm_embedding, model_dir)` — 从预计算 1280 维嵌入向量直接
+  预测 OGT（供 `TPC_predictor.py` 复用已计算的嵌入，避免重复运行 ESM-2）。
+- `predict_ogt_from_fasta(fasta_path, model_dir)` — 端到端：FASTA → ESM-2 → OGT。
+  核苷酸输入时内部自动调用 Prodigal。
 
 ### `code/FBA_anchor_point.py`
 基因组规模代谢模型重建与 FBA。
@@ -169,9 +157,8 @@ UDE TPC 形状模型的训练脚本。
 - `core_model_checkpoint.pt` — UDE 编码器/参数头/残差权重 + 元数据（emb_len、
   n_patches、t_mean_k、t_std_k、esm_cols、hyperparams）。
 - `core_model_scaler.pkl` — 在 ESM 嵌入上拟合的 `sklearn.StandardScaler`。
-- `ogt_mlp/mlp.pkl` — 在全部 3131 个基因组上训练的最终 OGT MLP。
-- `ogt_mlp/scaler.pkl` — 在 526 个特征上拟合的 `StandardScaler`。
-- `ogt_mlp/feature_cols.pkl` — 526 个特征列名的有序列表。
+- `ogt_mlp/mlp.pkl` — 在 ESM-2 嵌入上训练的最终 OGT MLP。
+- `ogt_mlp/scaler.pkl` — 在 1280 维 ESM 嵌入上拟合的 `StandardScaler`。
 - `ogt_mlp/cv_results.json` — 每折的 10 折交叉验证指标。
 
 ### `Train/`
@@ -197,7 +184,6 @@ pip install fair-esm          # 推荐：Facebook 官方库
 
 # 基因预测（需要 Linux/Mac 环境或 WSL）：
 # Prodigal: https://github.com/hyattpd/Prodigal
-# Barrnap:  https://github.com/tseemann/barrnap
 
 # FBA（可选）：
 pip install cobra carveme
@@ -221,7 +207,8 @@ unzip ncbi_dataset.zip
 
 ### 第 2 步 — 预测 OGT
 
-提取 526 维基因组特征，通过训练好的 MLP 预测 OGT：
+OGT MLP 使用与 TPC 模型相同的 ESM-2 蛋白质组嵌入，因此嵌入只需计算一次即可共用。
+可直接从 FASTA 预测 OGT：
 
 ```bash
 python code/OGT_predictor.py predict \
@@ -231,10 +218,18 @@ python code/OGT_predictor.py predict \
 
 预期输出：
 ```
+[OGT/ESM] Nucleotide FASTA -- running Prodigal ...
+[OGT/ESM] Embedding 4321 proteins with ESM-2 ...
 Predicted OGT: 36.8 C
 ```
 
-> 若 Prodigal 或 Barrnap 不可用，可在第 4 步直接通过参数指定已知 OGT：`ogt_c = 37.0`。
+若已在第 3 步保存了嵌入文件，也可直接从嵌入预测（更快）：
+
+```bash
+python code/OGT_predictor.py predict --embedding ecoli_esm_embedding.npy
+```
+
+> 若 Prodigal 不可用，可在第 4 步直接通过参数指定已知 OGT：`ogt_c = 37.0`。
 
 ### 第 3 步 — 计算 ESM-2 蛋白质组嵌入
 
@@ -377,12 +372,11 @@ python examples/example_ecoli.py
 
 ### 重新训练 OGT MLP
 
-准备两个 CSV 文件（细菌和古菌），各含 526 个特征列和 `OGT` 列（°C）：
+准备一个 CSV 文件，包含 `esm2_0 … esm2_1279` 嵌入列和 `OGT` 列（°C）。
+TPC 数据集 CSV 已满足此格式，可直接使用：
 
 ```bash
-python code/OGT_predictor.py train \
-    --bacteria_csv data/calculated_features_bacteria.csv \
-    --archaea_csv  data/calculated_features_archaea.csv
+python code/OGT_predictor.py train --data data/your_tpc_dataset.csv
 ```
 
 结果保存到 `results/ogt_mlp/`，训练日志保存到 `Train/ogt_mlp_cv_log.csv`。
@@ -402,13 +396,10 @@ python code/core_model.py --data data/your_tpc_dataset.csv
 
 ## OGT 模型性能
 
-| 划分方式          | RMSE（°C） | MAE（°C） | R2   |
-|------------------|-----------|----------|------|
-| 10 折 CV 总体    | 5.12      | 3.91     | 0.87 |
-| 最佳折           | 4.58      | 3.50     | 0.92 |
-| 最差折           | 5.75      | 4.31     | 0.80 |
+切换到 ESM-2 嵌入输入后，性能数据将在重新训练后更新。
+根据近年文献，蛋白质组 ESM-2 嵌入方案的预期 RMSE 约为 3.5–4.5°C。
 
-训练集：2869 株细菌 + 262 株古菌（GTDB 分类体系）。
+运行 `python code/OGT_predictor.py train --data <csv>` 可在自己的数据集上重新训练并获取最新性能指标。
 
 ---
 
