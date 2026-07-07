@@ -1,20 +1,19 @@
 {
-  "model": "MLPRegressor",
-  "hidden_layers": [
-    256,
-    128,
-    64
-  ],
-  "n_folds": 10,
-  "fold_results": [
+  "n_samples": 3131,
+  "n_features": 526,
+  "overall": {
+    "rmse": 5.1198,
+    "mae": 3.908,
+    "r2": 0.8668
+  },
+  "folds": [
     {
       "fold": 1,
       "rmse": 4.8352,
       "mae": 3.7551,
       "r2": 0.8806,
       "n_train": 2817,
-      "n_test": 314,
-      "n_iter": 55
+      "n_test": 314
     },
     {
       "fold": 2,
@@ -22,8 +21,7 @@
       "mae": 4.1804,
       "r2": 0.842,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 73
+      "n_test": 313
     },
     {
       "fold": 3,
@@ -31,8 +29,7 @@
       "mae": 4.2813,
       "r2": 0.8393,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 49
+      "n_test": 313
     },
     {
       "fold": 4,
@@ -40,8 +37,7 @@
       "mae": 3.8952,
       "r2": 0.8571,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 40
+      "n_test": 313
     },
     {
       "fold": 5,
@@ -49,8 +45,7 @@
       "mae": 4.0734,
       "r2": 0.851,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 52
+      "n_test": 313
     },
     {
       "fold": 6,
@@ -58,8 +53,7 @@
       "mae": 3.4978,
       "r2": 0.9186,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 46
+      "n_test": 313
     },
     {
       "fold": 7,
@@ -67,8 +61,7 @@
       "mae": 3.6584,
       "r2": 0.8927,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 66
+      "n_test": 313
     },
     {
       "fold": 8,
@@ -76,8 +69,7 @@
       "mae": 3.6708,
       "r2": 0.8755,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 55
+      "n_test": 313
     },
     {
       "fold": 9,
@@ -85,8 +77,7 @@
       "mae": 3.7613,
       "r2": 0.8755,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 43
+      "n_test": 313
     },
     {
       "fold": 10,
@@ -94,13 +85,25 @@
       "mae": 4.3064,
       "r2": 0.7961,
       "n_train": 2818,
-      "n_test": 313,
-      "n_iter": 68
+      "n_test": 313
     }
   ],
-  "overall": {
-    "rmse": 5.1198,
-    "mae": 3.908,
-    "r2": 0.8668
+  "mlp_params": {
+    "hidden_layer_sizes": [
+      256,
+      128,
+      64
+    ],
+    "activation": "relu",
+    "solver": "adam",
+    "alpha": 0.0001,
+    "learning_rate": "adaptive",
+    "learning_rate_init": 0.001,
+    "max_iter": 500,
+    "early_stopping": true,
+    "validation_fraction": 0.1,
+    "n_iter_no_change": 20,
+    "batch_size": 64,
+    "random_state": 42
   }
 }

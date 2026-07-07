@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
 """
-OGT_predictor.py  --  Train and apply the OGT MLP predictor.
+OGT_predictor.py  --  Train and apply the genomic-feature OGT MLP.
 
-Uses mean-pooled ESM-2 proteome embeddings (1280-dim) as the sole input.
-The MLP maps the embedding to a scalar optimal growth temperature (OGT) in degrees C.
+Predicts Optimal Growth Temperature (OGT) from a genome FASTA file by
+extracting 526 sequence-derived features and passing them through a
+multilayer perceptron (MLP) regressor.
+
+Feature groups (526 total)
+--------------------------
+    Genome size                                             1
+    rRNA nucleotide composition + MFE/len (5S/16S/23S)    15
+    tRNA nucleotide composition + MFE/len                   5
+    Genome GC fraction                                      1
+    Proteome AA fractions (GC-normalised + raw)            40
+    Proteome properties (length, charge, stability ratios)  5
+    Codon usage in ORFs (59 codons, excluding stops/M/W)   59
+    Dipeptide frequencies (20x20)                         400
+    ---------------------------------------------------------
+    Total                                                 526
+
+MFE features require ViennaRNA (RNAfold) on PATH; set to 0 if absent.
+Prodigal and Barrnap must be on PATH for FASTA-based prediction.
 
 Modes
 -----
-    Training (from a CSV containing ESM embedding columns and OGT labels):
-        python code/OGT_predictor.py train --data data/tpc_dataset.csv
+    Train from pre-computed feature CSVs:
+        python code/OGT_predictor.py train \\
+            --bacteria_csv data/calculated_features_bacteria.csv \\
+            --archaea_csv  data/calculated_features_archaea.csv
 
-    Prediction from a FASTA file (requires Prodigal on PATH):
+    Predict OGT from a genome FASTA:
         python code/OGT_predictor.py predict --fasta genome.fna
 
-    Prediction from a pre-computed embedding (.npy file, shape 1280):
-        python code/OGT_predictor.py predict --embedding emb.npy
-
-Training CSV format
--------------------
-    Must contain columns  esm2_0 ... esm2_1279  and one of:
-    OGT, ogt, optimal_growth_temperature, OGT_C  (values in degrees C).
-    Additional columns (species, kingdom, etc.) are ignored.
+    Predict from a pre-computed feature CSV:
+        python code/OGT_predictor.py predict --feature_csv features.csv
 """
 
-import json, argparse, warnings, pickle
+import sys, json, argparse, subprocess, warnings, pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -45,21 +58,26 @@ TRAIN_DIR   = REPO_DIR / "Train"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_DIR.mkdir(parents=True, exist_ok=True)
 
-MLP_PATH    = RESULTS_DIR / "mlp.pkl"
-SCALER_PATH = RESULTS_DIR / "scaler.pkl"
-CV_PATH     = RESULTS_DIR / "cv_results.json"
+MLP_PATH          = RESULTS_DIR / "mlp.pkl"
+SCALER_PATH       = RESULTS_DIR / "scaler.pkl"
+FEATURE_COLS_PATH = RESULTS_DIR / "feature_cols.pkl"
+CV_RESULTS_PATH   = RESULTS_DIR / "cv_results.json"
 
-ESM_DIM  = 1280
-ESM_COLS = [f"esm2_{i}" for i in range(ESM_DIM)]
+# Columns in the training CSV that are NOT features
+META_COLS = {
+    'Unnamed: 0', 'domain', 'phylum', 'class', 'order',
+    'family', 'genus', 'species', 'OGT'
+}
 
 # ============================================================
-# MLP hyperparameters
+# MLP hyperparameters  (mirrors Chapter2/OGT/Code/train_ogt_mlp.py)
 # ============================================================
 MLP_PARAMS = dict(
     hidden_layer_sizes  = (256, 128, 64),
-    activation          = "relu",
-    solver              = "adam",
+    activation          = 'relu',
+    solver              = 'adam',
     alpha               = 1e-4,
+    learning_rate       = 'adaptive',
     learning_rate_init  = 1e-3,
     max_iter            = 500,
     early_stopping      = True,
@@ -70,147 +88,169 @@ MLP_PARAMS = dict(
 )
 
 # ============================================================
+# Feature constants
+# ============================================================
+AA_ALPHABET = list('ACDEFGHIKLMNPQRSTVWY')  # 20 standard amino acids, sorted
+
+DIPEPTIDE_COLS = [f'Pro_{a}{b}' for a in AA_ALPHABET for b in AA_ALPHABET]  # 400
+
+# Standard genetic code (used for codon-feature naming)
+_CODON_TO_AA = {
+    'TTT':'F','TTC':'F','TTA':'L','TTG':'L',
+    'CTT':'L','CTC':'L','CTA':'L','CTG':'L',
+    'ATT':'I','ATC':'I','ATA':'I','ATG':'M',
+    'GTT':'V','GTC':'V','GTA':'V','GTG':'V',
+    'TCT':'S','TCC':'S','TCA':'S','TCG':'S',
+    'CCT':'P','CCC':'P','CCA':'P','CCG':'P',
+    'ACT':'T','ACC':'T','ACA':'T','ACG':'T',
+    'GCT':'A','GCC':'A','GCA':'A','GCG':'A',
+    'TAT':'Y','TAC':'Y','TAA':'*','TAG':'*',
+    'CAT':'H','CAC':'H','CAA':'Q','CAG':'Q',
+    'AAT':'N','AAC':'N','AAA':'K','AAG':'K',
+    'GAT':'D','GAC':'D','GAA':'E','GAG':'E',
+    'TGT':'C','TGC':'C','TGA':'*','TGG':'W',
+    'CGT':'R','CGC':'R','CGA':'R','CGG':'R',
+    'AGT':'S','AGC':'S','AGA':'R','AGG':'R',
+    'GGT':'G','GGC':'G','GGA':'G','GGG':'G',
+}
+
+# 59 codon features in the exact CSV column order (stops + ATG + TGG excluded)
+_CODON_COL_ORDER = [
+    'AAA','AAT','AAG','AAC',
+    'ATA','ATT','ATC',
+    'AGA','AGT','AGG','AGC',
+    'ACA','ACT','ACG','ACC',
+    'TAT','TAC',
+    'TTA','TTT','TTG','TTC',
+    'TGT','TGC',
+    'TCA','TCT','TCG','TCC',
+    'GAA','GAT','GAG','GAC',
+    'GTA','GTT','GTG','GTC',
+    'GGA','GGT','GGG','GGC',
+    'GCA','GCT','GCG','GCC',
+    'CAA','CAT','CAG','CAC',
+    'CTA','CTT','CTG','CTC',
+    'CGA','CGT','CGG','CGC',
+    'CCA','CCT','CCG','CCC',
+]
+CODON_COLS = [f'{_CODON_TO_AA[c]}_ORF_{c}' for c in _CODON_COL_ORDER]  # 59
+
+# ============================================================
 # Training
 # ============================================================
 
-def _load_training_data(data_csv: Path):
-    """Load a CSV with ESM columns and an OGT column. Returns X (n, 1280), y (n,)."""
-    df = pd.read_csv(data_csv)
+def _load_training_data(bacteria_csv, archaea_csv):
+    """Merge the two feature CSVs; return X, y, feature_cols."""
+    frames = []
+    for path, label in [(bacteria_csv, 'bacteria'), (archaea_csv, 'archaea')]:
+        df = pd.read_csv(path)
+        df['_domain'] = label
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
 
-    ogt_col = next(
-        (c for c in ["OGT", "ogt", "optimal_growth_temperature", "OGT_C"]
-         if c in df.columns),
-        None
-    )
-    if ogt_col is None:
-        raise ValueError(
-            f"No OGT column found in {data_csv}. "
-            "Expected one of: OGT, ogt, optimal_growth_temperature, OGT_C")
+    if 'OGT' not in df.columns:
+        raise ValueError("'OGT' column not found in training CSV")
 
-    missing_esm = [c for c in ESM_COLS if c not in df.columns]
-    if missing_esm:
-        raise ValueError(
-            f"{len(missing_esm)} ESM columns missing (e.g. {missing_esm[0]}). "
-            "The CSV must contain columns esm2_0 ... esm2_1279.")
+    feature_cols = [c for c in df.columns if c not in META_COLS and c != '_domain']
+    df['OGT'] = pd.to_numeric(df['OGT'], errors='coerce')
+    df = df.dropna(subset=['OGT']).reset_index(drop=True)
 
-    df[ogt_col] = pd.to_numeric(df[ogt_col], errors="coerce")
-    df = df.dropna(subset=[ogt_col] + ESM_COLS).reset_index(drop=True)
+    X = df[feature_cols].fillna(0.0).values.astype(np.float64)
+    y = df['OGT'].values.astype(np.float64)
 
-    # One row per unique organism (drop duplicate embeddings if dataset has multiple
-    # temperature points per species)
-    if "binomial_name" in df.columns:
-        df = df.drop_duplicates(subset="binomial_name").reset_index(drop=True)
-    elif "species" in df.columns:
-        df = df.drop_duplicates(subset="species").reset_index(drop=True)
-
-    X = df[ESM_COLS].values.astype(np.float32)
-    y = df[ogt_col].values.astype(np.float32)
-
-    print(f"Training data: {len(df)} organisms | ESM dim = {ESM_DIM}")
-    return X, y
+    print(f"Training data: {len(df)} samples "
+          f"(Bacteria: {(df['_domain']=='bacteria').sum()}, "
+          f"Archaea: {(df['_domain']=='archaea').sum()})")
+    print(f"Features: {len(feature_cols)}  |  OGT range: [{y.min():.1f}, {y.max():.1f}] C")
+    return X, y, feature_cols
 
 
-def train_ogt_mlp(data_csv: Path):
+def train_ogt_mlp(bacteria_csv, archaea_csv):
     """10-fold CV then final model on all data.
 
-    Saves results/ogt_mlp/mlp.pkl, scaler.pkl, cv_results.json
+    Saves results/ogt_mlp/mlp.pkl, scaler.pkl, feature_cols.pkl, cv_results.json
     and Train/ogt_mlp_cv_log.csv.
     """
-    X, y = _load_training_data(data_csv)
+    X, y, feature_cols = _load_training_data(bacteria_csv, archaea_csv)
 
     kf = KFold(n_splits=10, shuffle=True, random_state=42)
     fold_results = []
+    all_preds = np.zeros(len(y))
 
     print("\n10-fold cross-validation:")
     for fold, (tr, va) in enumerate(kf.split(X), 1):
         scaler = StandardScaler().fit(X[tr])
-        mlp    = MLPRegressor(**MLP_PARAMS).fit(scaler.transform(X[tr]), y[tr])
+        mlp    = MLPRegressor(**MLP_PARAMS)
+        mlp.fit(scaler.transform(X[tr]), y[tr])
         y_pred = mlp.predict(scaler.transform(X[va]))
+        all_preds[va] = y_pred
 
         rmse = float(np.sqrt(mean_squared_error(y[va], y_pred)))
         mae  = float(mean_absolute_error(y[va], y_pred))
         r2   = float(r2_score(y[va], y_pred))
-        fold_results.append({"fold": fold, "RMSE": rmse, "MAE": mae, "R2": r2})
-        print(f"  Fold {fold:2d}: RMSE={rmse:.2f}  MAE={mae:.2f}  R2={r2:.4f}")
+        fold_results.append({'fold': fold, 'rmse': round(rmse, 4),
+                             'mae': round(mae, 4), 'r2': round(r2, 4),
+                             'n_train': len(tr), 'n_test': len(va)})
+        print(f"  Fold {fold:2d}: RMSE={rmse:.4f}  MAE={mae:.4f}  R2={r2:.4f}")
 
-    rmse_arr = [d["RMSE"] for d in fold_results]
-    mae_arr  = [d["MAE"]  for d in fold_results]
-    r2_arr   = [d["R2"]   for d in fold_results]
-    print(f"\nOverall: RMSE={np.mean(rmse_arr):.2f}+/-{np.std(rmse_arr):.2f}  "
-          f"MAE={np.mean(mae_arr):.2f}  R2={np.mean(r2_arr):.4f}")
+    overall_rmse = float(np.sqrt(mean_squared_error(y, all_preds)))
+    overall_mae  = float(mean_absolute_error(y, all_preds))
+    overall_r2   = float(r2_score(y, all_preds))
+    print(f"\nOverall CV: RMSE={overall_rmse:.4f}  MAE={overall_mae:.4f}  R2={overall_r2:.4f}")
 
     cv_summary = {
-        "n_samples":  int(len(y)),
-        "n_features": ESM_DIM,
-        "input":      "ESM-2 mean-pooled proteome embedding (1280-dim)",
-        "rmse_mean":  float(np.mean(rmse_arr)),
-        "rmse_std":   float(np.std(rmse_arr)),
-        "mae_mean":   float(np.mean(mae_arr)),
-        "r2_mean":    float(np.mean(r2_arr)),
-        "folds":      fold_results,
-        "mlp_params": MLP_PARAMS,
+        'n_samples':   int(len(y)),
+        'n_features':  int(len(feature_cols)),
+        'overall':     {'rmse': round(overall_rmse, 4),
+                        'mae':  round(overall_mae, 4),
+                        'r2':   round(overall_r2, 4)},
+        'folds':       fold_results,
+        'mlp_params':  MLP_PARAMS,
     }
-    with open(CV_PATH, "w") as fh:
+    with open(CV_RESULTS_PATH, 'w') as fh:
         json.dump(cv_summary, fh, indent=2)
-    pd.DataFrame(fold_results).to_csv(TRAIN_DIR / "ogt_mlp_cv_log.csv", index=False)
-    print(f"CV results saved: {CV_PATH}")
+    pd.DataFrame(fold_results).to_csv(TRAIN_DIR / 'ogt_mlp_cv_log.csv', index=False)
+    print(f"CV results saved: {CV_RESULTS_PATH}")
 
     print("\nFitting final model on all data ...")
     final_scaler = StandardScaler().fit(X)
-    final_mlp    = MLPRegressor(**MLP_PARAMS).fit(final_scaler.transform(X), y)
+    final_mlp    = MLPRegressor(**MLP_PARAMS)
+    final_mlp.fit(final_scaler.transform(X), y)
 
-    with open(MLP_PATH,    "wb") as fh: pickle.dump(final_mlp,    fh)
-    with open(SCALER_PATH, "wb") as fh: pickle.dump(final_scaler, fh)
+    with open(MLP_PATH,          'wb') as fh: pickle.dump(final_mlp,    fh)
+    with open(SCALER_PATH,       'wb') as fh: pickle.dump(final_scaler, fh)
+    with open(FEATURE_COLS_PATH, 'wb') as fh: pickle.dump(feature_cols, fh)
     print(f"Saved: {MLP_PATH}")
     print(f"Saved: {SCALER_PATH}")
+    print(f"Saved: {FEATURE_COLS_PATH}")
 
 
 # ============================================================
-# Load saved OGT model
+# Load saved model
 # ============================================================
 
 def load_ogt_model(model_dir=None):
-    """Load trained OGT MLP and its StandardScaler. Returns (mlp, scaler)."""
+    """Load trained OGT MLP, scaler, and feature column list."""
     d = Path(model_dir) if model_dir else RESULTS_DIR
-    with open(d / "mlp.pkl",    "rb") as fh: mlp    = pickle.load(fh)
-    with open(d / "scaler.pkl", "rb") as fh: scaler = pickle.load(fh)
-    return mlp, scaler
+    with open(d / 'mlp.pkl',          'rb') as fh: mlp   = pickle.load(fh)
+    with open(d / 'scaler.pkl',        'rb') as fh: scl   = pickle.load(fh)
+    with open(d / 'feature_cols.pkl',  'rb') as fh: cols  = pickle.load(fh)
+    return mlp, scl, cols
 
 
 # ============================================================
-# Prediction from a pre-computed embedding
-# ============================================================
-
-def predict_ogt_from_embedding(esm_embedding, model_dir=None) -> float:
-    """Predict OGT from a pre-computed 1280-dim ESM-2 proteome embedding.
-
-    Parameters
-    ----------
-    esm_embedding : array-like of shape (1280,)
-    model_dir     : path to results/ogt_mlp/ (uses default if None)
-
-    Returns
-    -------
-    float -- predicted OGT in degrees C
-    """
-    mlp, scaler = load_ogt_model(model_dir)
-    x = np.asarray(esm_embedding, dtype=np.float32).reshape(1, -1)
-    return float(mlp.predict(scaler.transform(x))[0])
-
-
-# ============================================================
-# ESM-2 extraction helpers (self-contained, no circular import)
+# Feature extraction from FASTA
 # ============================================================
 
 def _read_fasta(path):
     seqs = []
-    h = s = ""
+    h = s = ''
     with open(path) as fh:
         for line in fh:
             line = line.strip()
-            if line.startswith(">"):
+            if line.startswith('>'):
                 if h and s: seqs.append((h, s))
-                h = line[1:].split()[0]; s = ""
+                h = line[1:].split()[0]; s = ''
             else:
                 s += line
     if h and s: seqs.append((h, s))
@@ -218,138 +258,258 @@ def _read_fasta(path):
 
 
 def _is_nucleotide(path):
-    text = Path(path).read_text(errors="ignore").upper()
-    body = "".join(l for l in text.splitlines() if not l.startswith(">"))
+    text = Path(path).read_text(errors='ignore').upper()
+    body = ''.join(l for l in text.splitlines() if not l.startswith('>'))
     if not body: return True
-    return sum(body.count(c) for c in "ACGTN") / len(body) > 0.80
+    return sum(body.count(c) for c in 'ACGTN') / len(body) > 0.80
 
 
-def _call_prodigal(genome_fasta, out_dir):
-    import subprocess
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    protein_out = out_dir / "proteins.faa"
-    r = subprocess.run(
-        ["prodigal", "-i", str(genome_fasta), "-a", str(protein_out), "-p", "meta", "-q"],
-        capture_output=True, text=True)
+def _nuc_fracs(seq):
+    """Nucleotide A/T/G/C fractions of a sequence."""
+    seq = seq.upper().replace('U', 'T')
+    n = len(seq) or 1
+    return {nuc: seq.count(nuc) / n for nuc in 'ATGC'}
+
+
+def _run_rnafold(seq):
+    """Return MFE/len via ViennaRNA RNAfold; 0.0 if not available."""
+    try:
+        res = subprocess.run(['RNAfold', '--noPS'],
+                             input=seq, capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return 0.0
+        # last line: structure (mfe)  -> "(((...))) (-12.34)"
+        last = res.stdout.strip().split('\n')[-1]
+        mfe = float(last.split('(')[-1].rstrip(')').strip())
+        return mfe / len(seq) if len(seq) > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _run_barrnap(genome_fasta, tmp_dir):
+    """Run Barrnap; return dict {rna_type: [seq, ...]} for 5S/16S/23S and tRNA."""
+    tmp_dir = Path(tmp_dir)
+    rrna_out = tmp_dir / 'rrna.fna'
+    cmd = ['barrnap', '--quiet', '--outseq', str(rrna_out), str(genome_fasta)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not rrna_out.exists():
+        return {}
+    seqs = _read_fasta(rrna_out)
+    result = {'5S': [], '16S': [], '23S': [], 'tRNA': []}
+    for h, s in seqs:
+        h_up = h.upper()
+        for k in ('5S', '16S', '23S'):
+            if k in h_up:
+                result[k].append(s)
+                break
+        else:
+            if 'TRNA' in h_up:
+                result['tRNA'].append(s)
+    return result
+
+
+def _run_prodigal(genome_fasta, tmp_dir):
+    """Run Prodigal; return (protein_seqs, cds_seqs)."""
+    tmp_dir = Path(tmp_dir)
+    prot_out = tmp_dir / 'proteins.faa'
+    cds_out  = tmp_dir / 'cds.fna'
+    cmd = ['prodigal', '-i', str(genome_fasta),
+           '-a', str(prot_out), '-d', str(cds_out), '-p', 'meta', '-q']
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"Prodigal failed:\n{r.stderr}")
-    return protein_out
+    return _read_fasta(prot_out), _read_fasta(cds_out)
 
 
-def _extract_esm_embedding(fasta_path, tmp_dir=None, max_proteins=2000):
-    """Mean-pool ESM-2 over all proteins; return numpy array of shape (1280,).
-
-    Accepts genome (nucleotide) or proteome (amino acid) FASTA.
-    Requires fair-esm or transformers. Prodigal required for nucleotide input.
-    """
-    import torch
-    fasta_path = Path(fasta_path)
-    if tmp_dir is None:
-        tmp_dir = fasta_path.parent / "_tmp_ogt"
-
-    if _is_nucleotide(fasta_path):
-        print("[OGT/ESM] Nucleotide FASTA -- running Prodigal ...")
-        protein_fasta = _call_prodigal(fasta_path, tmp_dir)
-    else:
-        protein_fasta = fasta_path
-
-    seqs = _read_fasta(protein_fasta)
-    if not seqs:
-        raise ValueError(f"No sequences found in {protein_fasta}")
-    if len(seqs) > max_proteins:
-        import random as _rnd
-        seqs = _rnd.sample(seqs, max_proteins)
-        print(f"[OGT/ESM] Subsampled to {max_proteins} proteins")
-
-    print(f"[OGT/ESM] Embedding {len(seqs)} proteins with ESM-2 ...")
-    embeddings = []
-    try:
-        import esm as esm_lib
-        model_esm, alphabet = esm_lib.pretrained.esm2_t33_650M_UR50D()
-        batch_converter = alphabet.get_batch_converter()
-        model_esm.eval()
-        for i in range(0, len(seqs), 8):
-            batch = [(h, s[:1022]) for h, s in seqs[i:i+8]]
-            _, _, tokens = batch_converter(batch)
-            with torch.no_grad():
-                reps = model_esm(tokens, repr_layers=[33])["representations"][33]
-            for j, (_, s) in enumerate(batch):
-                embeddings.append(reps[j, 1:len(s[:1022])+1].mean(0).numpy())
-    except ImportError:
-        from transformers import AutoTokenizer, EsmModel
-        tok   = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
-        esm_m = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D").eval()
-        for i in range(0, len(seqs), 4):
-            batch_seqs = [s[:1022] for _, s in seqs[i:i+4]]
-            inp  = tok(batch_seqs, return_tensors="pt",
-                       padding=True, truncation=True, max_length=1024)
-            with torch.no_grad():
-                out = esm_m(**inp)
-            mask = inp["attention_mask"].unsqueeze(-1).float()
-            embeddings.extend(((out.last_hidden_state * mask).sum(1) / mask.sum(1)).numpy())
-
-    return np.mean(embeddings, axis=0).astype(np.float32)
-
-
-# ============================================================
-# Prediction from FASTA
-# ============================================================
-
-def predict_ogt_from_fasta(fasta_path, model_dir=None, tmp_dir=None) -> float:
-    """Predict OGT from a genome or proteome FASTA.
-
-    Extracts the mean-pooled ESM-2 proteome embedding, then applies the
-    trained MLP. Use predict_ogt_from_embedding() directly when the embedding
-    is already available (e.g. reusing the TPC embedding avoids a second ESM pass).
+def extract_genomic_features(genome_fasta, tmp_dir=None):
+    """Extract all 526 OGT-predictive features from a genome FASTA.
 
     Parameters
     ----------
-    fasta_path : str or Path -- nucleotide genome or amino acid proteome FASTA
+    genome_fasta : str or Path  -- nucleotide genome FASTA
+    tmp_dir      : working directory for Prodigal/Barrnap output
+
+    Returns
+    -------
+    dict mapping feature_name -> float
+    """
+    genome_fasta = Path(genome_fasta)
+    if tmp_dir is None:
+        tmp_dir = genome_fasta.parent / '_tmp_ogt'
+    Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+
+    # ---- Genome-level ----
+    contigs    = _read_fasta(genome_fasta)
+    genome_seq = ''.join(s for _, s in contigs).upper()
+    genome_size = float(len(genome_seq))
+    gc          = (genome_seq.count('G') + genome_seq.count('C')) / max(1, len(genome_seq))
+
+    feats = {'genome_size': genome_size, 'G_fraction_normalized': gc}
+
+    # ---- rRNA features (Barrnap) ----
+    rrna = _run_barrnap(genome_fasta, tmp_dir)
+    for rna_type in ('5S', '16S', '23S'):
+        cat = ''.join(rrna.get(rna_type, [])).upper()
+        nf  = _nuc_fracs(cat)
+        for nuc in 'ATGC':
+            feats[f'{rna_type}_rRNA_{nuc}'] = nf[nuc]
+        feats[f'{rna_type}_mfe_len'] = _run_rnafold(cat) if cat else 0.0
+
+    # ---- tRNA features (Barrnap) ----
+    trna_cat = ''.join(rrna.get('tRNA', [])).upper()
+    tnf      = _nuc_fracs(trna_cat)
+    for nuc in 'ATGC':
+        feats[f'tRNA_{nuc}'] = tnf[nuc]
+    feats['trna_mfe_len'] = _run_rnafold(trna_cat) if trna_cat else 0.0
+
+    # ---- Proteome features (Prodigal) ----
+    prot_raw, cds_raw = _run_prodigal(genome_fasta, tmp_dir)
+    prot_seqs = [s.rstrip('*') for _, s in prot_raw]
+    cds_seqs  = [s for _, s in cds_raw]
+
+    concat_aa = ''.join(prot_seqs).upper()
+    n_aa = max(1, len(concat_aa))
+
+    # Raw AA fractions
+    aa_raw = {aa: concat_aa.count(aa) / n_aa for aa in AA_ALPHABET}
+
+    # GC-normalised AA fractions  (raw / gc)
+    for aa in AA_ALPHABET:
+        feats[f'Pro_{aa}_frac_normed'] = aa_raw[aa] / gc if gc > 0 else aa_raw[aa]
+    for aa in AA_ALPHABET:
+        feats[f'Pro_{aa}'] = aa_raw[aa]
+
+    # Proteome aggregate properties
+    feats['Pro_mean_length']      = float(np.mean([len(s) for s in prot_seqs])) if prot_seqs else 0.0
+    feats['Pro_polar_charged']    = sum(aa_raw[a] for a in 'DEKRH')
+    feats['Pro_polar_hydrophobic']= sum(aa_raw[a] for a in 'AVFILMWP')
+    q  = aa_raw['Q'] or 1e-9
+    qh = (aa_raw['Q'] + aa_raw['H']) or 1e-9
+    feats['Pro_LK/Q']  = (aa_raw['L'] + aa_raw['K']) / q
+    feats['Pro_EK/QH'] = (aa_raw['E'] + aa_raw['K']) / qh
+
+    # Dipeptide frequencies
+    dp_counts = {f'Pro_{a}{b}': 0 for a in AA_ALPHABET for b in AA_ALPHABET}
+    dp_total  = 0
+    for seq in prot_seqs:
+        seq = seq.upper()
+        for i in range(len(seq) - 1):
+            dp = f'Pro_{seq[i]}{seq[i+1]}'
+            if dp in dp_counts:
+                dp_counts[dp] += 1
+                dp_total += 1
+    n_dp = max(1, dp_total)
+    for k in dp_counts:
+        feats[k] = dp_counts[k] / n_dp
+
+    # Codon usage (59 codons, stops/M/W excluded)
+    _EXCLUDED = {'TAA', 'TAG', 'TGA', 'ATG', 'TGG'}
+    cod_counts = {c: 0 for c in _CODON_COL_ORDER}
+    cod_total  = 0
+    for cds in cds_seqs:
+        cds = cds.upper().replace('U', 'T')
+        for i in range(0, len(cds) - 2, 3):
+            codon = cds[i:i+3]
+            if codon in cod_counts:
+                cod_counts[codon] += 1
+                cod_total += 1
+    n_cod = max(1, cod_total)
+    for codon, count in cod_counts.items():
+        feats[f'{_CODON_TO_AA[codon]}_ORF_{codon}'] = count / n_cod
+
+    return feats
+
+
+# ============================================================
+# Prediction helpers
+# ============================================================
+
+def _features_to_vector(feat_dict, feature_cols):
+    """Arrange feature dict into a numpy array matching feature_cols order."""
+    return np.array([feat_dict.get(c, 0.0) for c in feature_cols],
+                    dtype=np.float64).reshape(1, -1)
+
+
+def predict_ogt_from_features(feat_dict, model_dir=None):
+    """Predict OGT from a pre-computed feature dict."""
+    mlp, scl, cols = load_ogt_model(model_dir)
+    X = _features_to_vector(feat_dict, cols)
+    return float(mlp.predict(scl.transform(X))[0])
+
+
+def predict_ogt_from_fasta(fasta_path, model_dir=None, tmp_dir=None):
+    """Extract genomic features from a FASTA file and predict OGT.
+
+    Parameters
+    ----------
+    fasta_path : str or Path -- genome FASTA (nucleotide)
     model_dir  : path to results/ogt_mlp/ (uses default if None)
-    tmp_dir    : working directory for Prodigal intermediate files
+    tmp_dir    : working directory for Prodigal/Barrnap output
 
     Returns
     -------
     float -- predicted OGT in degrees C
     """
-    emb = _extract_esm_embedding(fasta_path, tmp_dir=tmp_dir)
-    return predict_ogt_from_embedding(emb, model_dir=model_dir)
+    fasta_path = Path(fasta_path)
+    if not _is_nucleotide(fasta_path):
+        raise ValueError(
+            f"{fasta_path} looks like a protein FASTA; OGT predictor requires "
+            "a nucleotide genome FASTA to extract rRNA and codon features.")
+    feats = extract_genomic_features(fasta_path, tmp_dir=tmp_dir)
+    return predict_ogt_from_features(feats, model_dir=model_dir)
+
+
+def predict_ogt_from_csv(feature_csv, model_dir=None):
+    """Batch-predict OGT from a pre-computed feature CSV."""
+    mlp, scl, cols = load_ogt_model(model_dir)
+    df = pd.read_csv(feature_csv)
+    X = df[[c for c in cols if c in df.columns]].fillna(0.0).values.astype(np.float64)
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        print(f"Warning: {len(missing)} feature columns missing — filled with 0")
+    df['predicted_OGT_C'] = mlp.predict(scl.transform(X))
+    return df
 
 
 # ============================================================
 # CLI entry point
 # ============================================================
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OGT predictor: train or predict")
-    sub = parser.add_subparsers(dest="mode", required=True)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='OGT predictor: train or predict from genomic sequence features')
+    sub = parser.add_subparsers(dest='mode', required=True)
 
-    train_p = sub.add_parser("train", help="Train OGT MLP from a CSV with ESM embeddings")
-    train_p.add_argument("--data", required=True, type=Path,
-                         help="CSV with esm2_0...esm2_1279 columns and an OGT column")
+    train_p = sub.add_parser('train', help='Train OGT MLP from feature CSVs')
+    train_p.add_argument('--bacteria_csv', required=True, type=Path,
+                         help='CSV with 526 genomic features for bacteria')
+    train_p.add_argument('--archaea_csv',  required=True, type=Path,
+                         help='CSV with 526 genomic features for archaea')
 
-    pred_p = sub.add_parser("predict", help="Predict OGT from FASTA or embedding file")
+    pred_p = sub.add_parser('predict', help='Predict OGT from FASTA or feature CSV')
     grp = pred_p.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--fasta",     type=Path,
-                     help="Genome (nucleotide) or proteome (amino acid) FASTA")
-    grp.add_argument("--embedding", type=Path,
-                     help="Pre-computed ESM-2 embedding as .npy file (shape 1280)")
-    pred_p.add_argument("--model_dir", type=Path, default=RESULTS_DIR,
-                         help="Directory containing mlp.pkl and scaler.pkl")
-    pred_p.add_argument("--tmp_dir",   type=Path, default=None,
-                         help="Working directory for Prodigal output")
+    grp.add_argument('--fasta',       type=Path, help='Genome FASTA file (nucleotide)')
+    grp.add_argument('--feature_csv', type=Path, help='Pre-computed 526-feature CSV')
+    pred_p.add_argument('--model_dir', type=Path, default=RESULTS_DIR)
+    pred_p.add_argument('--tmp_dir',   type=Path, default=None,
+                         help='Working directory for Prodigal/Barrnap output')
+    pred_p.add_argument('--output',    type=Path, default=None,
+                         help='Output CSV (batch mode only)')
 
     args = parser.parse_args()
 
-    if args.mode == "train":
-        train_ogt_mlp(args.data)
+    if args.mode == 'train':
+        train_ogt_mlp(args.bacteria_csv, args.archaea_csv)
 
-    elif args.mode == "predict":
+    elif args.mode == 'predict':
         if args.fasta:
-            ogt = predict_ogt_from_fasta(args.fasta, model_dir=args.model_dir,
+            ogt = predict_ogt_from_fasta(args.fasta,
+                                         model_dir=args.model_dir,
                                          tmp_dir=args.tmp_dir)
+            print(f"Predicted OGT: {ogt:.1f} C")
         else:
-            emb = np.load(args.embedding)
-            ogt = predict_ogt_from_embedding(emb, model_dir=args.model_dir)
-        print(f"Predicted OGT: {ogt:.1f} C")
+            df_out = predict_ogt_from_csv(args.feature_csv, model_dir=args.model_dir)
+            out = args.output or Path(args.feature_csv).with_suffix('_ogt_pred.csv')
+            df_out.to_csv(out, index=False)
+            print(f"Predictions saved to: {out}")
+            print(df_out[['predicted_OGT_C']].describe())
