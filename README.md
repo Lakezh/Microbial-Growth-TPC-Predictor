@@ -8,26 +8,30 @@ and optionally scaled to absolute growth rates via FBA.
 
 ## How it works
 
+**Three inputs → one output:**
+
+| Input | Description |
+|---|---|
+| Proteome FASTA | Amino acid sequences (genome FASTA also accepted — auto-converted via Prodigal) |
+| Temperature range | e.g. 5–80 °C, step 1 °C |
+| Medium JSON | Exchange reaction IDs + uptake rates for FBA absolute scaling |
+
 ```
-Proteome FASTA (amino acid sequences)
+Proteome FASTA  (genome → Prodigal → protein, if nucleotide input)
     |
-    +---> 425 protein features
-    |     (AA fractions + proteome props + dipeptides)
-    |              |
-    |          OGT MLP (256-128-64)
-    |              |
-    |          OGT (C) <-- hard Topt anchor
+    +---> 425 protein features --> OGT MLP --> OGT (C)  [hard Topt anchor]
+    |     (AA fracs + dipeptides + proteome props)
     |
     +---> ESM-2 mean-pooled embedding (1280-dim)
     |              |
     |       core_model (UDE/UTPC)
     |       ESMTempEncoder + UTPC ODE + constrained residual
     |              |
-    |       normalised TPC shape (peak = 1)
+    |       normalised TPC shape  (peak = 1)  over user-defined temperature range
     |              |
-    |  [optional] CarveMe GEM + COBRApy FBA --> peak growth rate (h-1)
+    |  Medium JSON --> CarveMe GEM + COBRApy FBA --> peak growth rate (h-1)
     |              |
-    Absolute TPC(T) = normalised_shape(T) x peak_rate
+    Absolute TPC(T) = normalised_shape(T) × peak_rate   [h-1 at each temperature]
 ```
 
 ---
@@ -181,190 +185,135 @@ Training records generated during model fitting (not committed by default):
 
 ---
 
-## Step-by-step usage example: *E. coli* K-12 MG1655
+## Usage: *E. coli* K-12 MG1655 example
 
-This walkthrough predicts the full TPC of *E. coli* K-12 MG1655 and, optionally, scales
-it to absolute growth rates using FBA.
+Three inputs are required to produce a complete absolute-scale TPC:
+
+| # | Input | What to prepare |
+|---|---|---|
+| 1 | **Proteome FASTA** | Amino acid sequences (or genome FASTA — auto-converted via Prodigal) |
+| 2 | **Temperature range** | Min / max / step in °C |
+| 3 | **Medium JSON** | Exchange reaction IDs + uptake rates |
 
 ### Step 0 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 
-# For ESM-2 embedding extraction:
+# ESM-2 (for TPC shape prediction):
 pip install fair-esm          # Facebook's official library (recommended)
 # or:  pip install transformers
 
-# For FBA (optional):
+# FBA (for absolute growth rate scaling):
 pip install cobra carveme
 ```
 
-### Step 1 — Download the proteome
+### Step 1 — Prepare inputs
 
-Download the *E. coli* K-12 MG1655 proteome from NCBI RefSeq:
-
-```
-Accession: GCF_000005845.2
-File:      GCF_000005845.2_ASM584v2_protein.faa
-```
+**1a. Download the proteome** from NCBI RefSeq (accession `GCF_000005845.2`):
 
 ```bash
 # Using NCBI datasets CLI (https://www.ncbi.nlm.nih.gov/datasets/):
 datasets download genome accession GCF_000005845.2 --include protein
 unzip ncbi_dataset.zip
-# proteome FASTA is at: ncbi_dataset/data/GCF_000005845.2/protein.faa
+# proteome FASTA: ncbi_dataset/data/GCF_000005845.2/protein.faa
 ```
 
-### Step 2 — Predict OGT from proteome features
+> If you only have a genome FASTA, pass it directly — the pipeline calls Prodigal
+> automatically to extract protein sequences.
 
-Extract 425 amino-acid-sequence features (AA fractions, dipeptides, proteome properties)
-and predict OGT using the trained MLP. Only a protein FASTA is required — no genome or
-gene-calling tools needed.
+**1b. Define the temperature range** — e.g. 5 to 80 °C in 1 °C steps (set via CLI flags
+or directly in Python as `np.arange(5, 81, 1)`).
+
+**1c. Prepare the medium JSON** — a file mapping BiGG exchange-reaction IDs to maximum
+uptake rates (mmol gDW⁻¹ h⁻¹). An example for *E. coli* M9 minimal medium is provided at
+`examples/example_medium_ecoli.json`:
+
+```json
+{
+  "EX_glc__D_e": 10.0,
+  "EX_o2_e":     20.0,
+  "EX_nh4_e":    10.0,
+  "EX_pi_e":     10.0,
+  "EX_so4_e":    10.0
+}
+```
+
+### Step 2 — Run the full pipeline (one command)
 
 ```bash
-python code/OGT_predictor.py predict \
-    --fasta ncbi_dataset/data/GCF_000005845.2/protein.faa \
-    --model_dir results/ogt_mlp
+python code/TPC_predictor.py \
+    --fasta   ncbi_dataset/data/GCF_000005845.2/protein.faa \
+    --medium  examples/example_medium_ecoli.json \
+    --temp_min 5 --temp_max 80 --temp_step 1 \
+    --output  ecoli_tpc.csv
 ```
+
+The script:
+1. Extracts 425 protein features → predicts OGT with the MLP
+2. Computes the ESM-2 proteome embedding → predicts the normalised TPC shape (UDE/UTPC)
+3. Reconstructs a GEM with CarveMe and runs FBA → gets the peak growth rate
+4. Multiplies shape × peak rate → writes the absolute TPC to `ecoli_tpc.csv`
 
 Expected output:
 ```
-Predicted OGT: 36.8 C
+[OGT] Predicted OGT = 36.8 C
+[ESM] Embedding 4321 proteins with ESM-2 ...
+[FBA] Growth rate = 0.9821 h-1
+
+Results saved to: ecoli_tpc.csv
+OGT used:   36.8 C
+UTPC Pmax:  3.2415
+UTPC E:     8.7632
+Plot saved to: ecoli_tpc.png
 ```
 
-> If you already know the OGT, you can skip this step and pass `--ogt 37.0` directly in
-> Step 4.
-
-### Step 3 — Compute ESM-2 proteome embedding
-
-Embed all proteins with ESM-2 and mean-pool (same proteome FASTA as Step 2):
-
-```python
-import esm, torch, numpy as np
-
-model_esm, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-model_esm.eval()
-batch_converter = alphabet.get_batch_converter()
-
-# Read protein sequences
-seqs = []
-with open("ncbi_dataset/data/GCF_000005845.2/protein.faa") as f:
-    h, s = "", ""
-    for line in f:
-        line = line.strip()
-        if line.startswith(">"):
-            if h and s: seqs.append((h, s))
-            h = line[1:].split()[0]; s = ""
-        else:
-            s += line
-    if h and s: seqs.append((h, s))
-
-# Embed in batches, mean-pool
-embeddings = []
-batch_size = 8
-for i in range(0, len(seqs), batch_size):
-    batch = [(h, s[:1022]) for h, s in seqs[i:i+batch_size]]
-    _, _, tokens = batch_converter(batch)
-    with torch.no_grad():
-        out = model_esm(tokens, repr_layers=[33])
-    for j, (_, s) in enumerate(batch):
-        embeddings.append(out["representations"][33][j, 1:len(s)+1].mean(0).numpy())
-
-esm_embedding = np.mean(embeddings, axis=0).astype(np.float32)  # shape (1280,)
-np.save("ecoli_esm_embedding.npy", esm_embedding)
-print(f"ESM embedding shape: {esm_embedding.shape}")
-```
-
-### Step 4 — Predict normalised TPC shape
-
-```python
-import numpy as np, sys
-sys.path.insert(0, "code")
-from TPC_predictor import load_model, predict_shape, plot_prediction
-
-# Load model
-model, scaler, meta, device = load_model()
-
-# Load embedding and predicted OGT
-esm_embedding = np.load("ecoli_esm_embedding.npy")
-ogt_c         = 36.8   # from Step 2 (or use 37.0 as the known value)
-temperatures  = np.arange(5, 75, 1, dtype=np.float32)
-
-# Predict
-result = predict_shape(model, scaler, meta, device,
-                       esm_embedding=esm_embedding,
-                       ogt_c=ogt_c,
-                       temperatures=temperatures)
-
-print(f"Topt:  {result['ToptC']:.1f} C")
-print(f"Pmax:  {result['Pmax']:.4f}")
-print(f"E:     {result['E']:.4f}")
-print(f"Peak at: {temperatures[result['pred_shape'].argmax()]:.0f} C")
-
-# Save CSV and plot
-import pandas as pd
-pd.DataFrame({"temperature_C": result["temperatures"],
-              "norm_shape":    result["pred_shape"]}).to_csv("ecoli_tpc.csv", index=False)
-plot_prediction(result, title="E. coli K-12 MG1655", save_path="ecoli_tpc.png")
-```
-
-Expected `ecoli_tpc.csv` (first few rows):
+`ecoli_tpc.csv`:
 
 ```
-temperature_C,norm_shape
-5.0,0.012
-10.0,0.041
-15.0,0.112
+temperature_C,norm_shape,abs_growth_rate_per_h
+5.0,0.012,0.0118
 ...
-37.0,1.000
+37.0,1.000,0.9821
 ...
-55.0,0.023
+80.0,0.001,0.0010
 ```
 
-### Step 5 — (Optional) Scale to absolute growth rates with FBA
+> **Skip FBA:** omit `--medium` to get a normalised TPC only (no CarveMe required).  
+> **Known OGT:** pass `--ogt 37.0` to skip OGT prediction.
 
-Provide the *E. coli* iJO1366 model and the M9 medium:
+### Step 3 — Python API (advanced)
+
+For programmatic use or batch processing:
 
 ```python
-import sys
+import numpy as np, json, sys
 sys.path.insert(0, "code")
-from FBA_anchor_point import get_peak_growth_rate
-import numpy as np, json
+from TPC_predictor import run_pipeline
 
 with open("examples/example_medium_ecoli.json") as f:
     medium = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
 
-# Reconstruct GEM and run FBA
-peak_rate = get_peak_growth_rate(
-    fasta_path    = "ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna",
-    medium        = medium,
-    temperature_c = 37.0,
+result = run_pipeline(
+    fasta_path   = "ncbi_dataset/data/GCF_000005845.2/protein.faa",
+    temperatures = np.arange(5, 81, 1, dtype=np.float32),
+    medium       = medium,          # omit for normalised TPC only
+    # ogt_c      = 37.0,            # uncomment to override OGT prediction
 )
-print(f"FBA peak growth rate: {peak_rate:.4f} h-1")
 
-# Scale the normalised TPC
-norm_shape = np.load("ecoli_tpc_shape.npy")  # or use result["pred_shape"] from Step 4
-absolute_tpc = norm_shape * peak_rate
-```
+print(f"OGT: {result['ogt_c']:.1f} C")
+print(f"Peak growth rate: {result['abs_growth_rate'].max():.4f} h-1")
 
-Expected output:
-```
-FBA peak growth rate: 0.9821 h-1
+import pandas as pd
+pd.DataFrame({
+    "temperature_C":        result["temperatures"],
+    "norm_shape":           result["norm_shape"],
+    "abs_growth_rate_per_h": result["abs_growth_rate"],
+}).to_csv("ecoli_tpc.csv", index=False)
 ```
 
 > **Note:** CarveMe requires a valid DIAMOND database and a compatible solver (CPLEX or
-> GLPK). See https://carveme.readthedocs.io for installation.
-
-### Step 6 — Run the bundled example
-
-The above steps are pre-packaged in `examples/example_ecoli.py` (with a placeholder
-embedding). Once you have a real ESM embedding, replace the `esm_embedding` variable and run:
-
-```bash
-python examples/example_ecoli.py
-# outputs: examples/output/ecoli_tpc.csv
-#          examples/output/ecoli_tpc.png
-```
+> GLPK). See https://carveme.readthedocs.io for installation details.
 
 ---
 

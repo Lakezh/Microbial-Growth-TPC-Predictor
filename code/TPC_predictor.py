@@ -479,31 +479,44 @@ def run_pipeline(fasta_path, temperatures, ogt_c=None, medium=None,
 
     Parameters
     ----------
-    fasta_path    : genome or proteome FASTA
+    fasta_path    : proteome FASTA (amino acid) or genome FASTA (nucleotide —
+                    Prodigal is run automatically to extract protein sequences)
     temperatures  : numpy array of temperatures in degrees C
     ogt_c         : optional OGT override in degrees C
     medium        : optional dict {exchange_rxn_id: uptake_rate} for FBA
+                    scaling to absolute growth rates
     checkpoint_path / scaler_path : model file paths
 
     Returns
     -------
     dict with:
-        temperatures   -- temperature array (C)
-        norm_shape     -- normalised TPC (peak = 1)
-        abs_growth_rate-- absolute growth rate (h-1) if FBA was run, else None
-        ogt_c          -- OGT used (C)
-        Pmax, E        -- UTPC parameters
+        temperatures    -- temperature array (C)
+        norm_shape      -- normalised TPC (peak = 1)
+        abs_growth_rate -- absolute growth rate array (h-1) if FBA was run, else None
+        ogt_c           -- OGT used (C)
+        Pmax, E         -- UTPC parameters
     """
+    fasta_path = Path(fasta_path)
+
+    # Auto-convert genome → proteome once; reuse protein_fasta for OGT + ESM + FBA
+    if is_nucleotide_fasta(fasta_path):
+        print("[Pipeline] Genome FASTA detected — running Prodigal to extract proteins ...")
+        _tmp = Path(tmp_dir) if tmp_dir else fasta_path.parent / "_tmp_esm"
+        protein_fasta = call_prodigal(fasta_path, _tmp)
+        print(f"[Pipeline] Proteins written to: {protein_fasta}")
+    else:
+        protein_fasta = fasta_path
+
     model, scaler, meta, device = load_model(checkpoint_path, scaler_path)
 
-    esm_emb = extract_esm_embedding(fasta_path, tmp_dir=tmp_dir)
+    esm_emb = extract_esm_embedding(protein_fasta, tmp_dir=tmp_dir)
 
     if ogt_c is None:
         print("[OGT] Predicting OGT from proteome sequence features ...")
         try:
             from OGT_predictor import predict_ogt_from_fasta
             ogt_c = predict_ogt_from_fasta(
-                fasta_path,
+                protein_fasta,
                 model_dir=RESULTS_DIR / "ogt_mlp",
             )
             print(f"[OGT] Predicted OGT = {ogt_c:.1f} C")
@@ -519,7 +532,7 @@ def run_pipeline(fasta_path, temperatures, ogt_c=None, medium=None,
             from FBA_anchor_point import get_peak_growth_rate
             print("[FBA] Running FBA to get absolute peak growth rate ...")
             abs_rate = get_peak_growth_rate(
-                fasta_path=fasta_path,
+                fasta_path=protein_fasta,
                 medium=medium,
                 temperature_c=ogt_c,
                 tmp_dir=tmp_dir
@@ -531,7 +544,7 @@ def run_pipeline(fasta_path, temperatures, ogt_c=None, medium=None,
     return {
         "temperatures":    result["temperatures"],
         "norm_shape":      result["pred_shape"],
-        "abs_growth_rate": result["norm_shape"] * abs_rate if abs_rate is not None else None,
+        "abs_growth_rate": result["pred_shape"] * abs_rate if abs_rate is not None else None,
         "ogt_c":           ogt_c,
         "Pmax":            result["Pmax"],
         "E":               result["E"],

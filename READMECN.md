@@ -1,32 +1,36 @@
 # 微生物生长温度性能曲线预测工具包
 
-基于物理约束深度学习（UDE/UTPC），通过基因组预测微生物完整**温度性能曲线（TPC）**，
-并可通过 FBA 将归一化曲线锚定为绝对生长速率（h⁻¹）。
+基于物理约束深度学习（UDE/UTPC），输入蛋白质组 FASTA、温度区间和培养基信息，
+预测微生物完整**温度性能曲线（TPC）**，并通过 FBA 将归一化曲线锚定为绝对生长速率（h⁻¹）。
 
 ---
 
 ## 工作原理
 
+**三类输入 → 完整 TPC：**
+
+| 输入 | 说明 |
+|---|---|
+| 蛋白质组 FASTA | 氨基酸序列（也可输入基因组 FASTA，自动调用 Prodigal 转换） |
+| 温度区间 | 例如 5–80°C，步长 1°C |
+| 培养基 JSON | 交换反应 ID + 摄取速率，用于 FBA 绝对定量 |
+
 ```
-蛋白质组 FASTA（氨基酸序列）
+蛋白质组 FASTA  （基因组 → Prodigal → 蛋白质，若输入核苷酸序列）
     |
-    +---> 425 维蛋白质特征
-    |     （氨基酸比例 + 蛋白质组属性 + 二肽频率）
-    |              |
-    |         OGT MLP（256-128-64）
-    |              |
-    |         OGT（°C）<-- 硬锚定 Topt
+    +---> 425 维蛋白质特征 --> OGT MLP --> OGT（°C）  [硬锚定 Topt]
+    |     （氨基酸比例 + 二肽频率 + 蛋白质组属性）
     |
     +---> ESM-2 均值池化嵌入（1280 维）
     |              |
-    |       core_model（UDE）
+    |       core_model（UDE/UTPC）
     |       ESM 编码器 + UTPC ODE + 约束残差 MLP
     |              |
-    |       归一化 TPC 形状（峰值=1）
+    |       归一化 TPC 形状（峰值=1）在用户指定温度区间上
     |              |
-    |  [可选] CarveMe GEM + COBRApy FBA --> 峰值生长速率（h⁻¹）
+    |  培养基 JSON --> CarveMe GEM + COBRApy FBA --> 峰值生长速率（h⁻¹）
     |              |
-    绝对 TPC(T) = 归一化形状(T) × 峰值速率
+    绝对 TPC(T) = 归一化形状(T) × 峰值速率   [h⁻¹，逐温度点]
 ```
 
 ---
@@ -172,182 +176,130 @@ UDE TPC 形状模型的训练脚本。
 
 ---
 
-## 分步使用示例：以大肠杆菌 K-12 MG1655 为例
+## 使用示例：以大肠杆菌 K-12 MG1655 为例
 
-本示例以大肠杆菌 K-12 MG1655 为例，演示如何预测完整 TPC，并可选择通过 FBA 转换为绝对生长速率。
+生成完整绝对量纲 TPC 需要三类输入：
+
+| # | 输入 | 说明 |
+|---|---|---|
+| 1 | **蛋白质组 FASTA** | 氨基酸序列（也可输入基因组 FASTA，自动调用 Prodigal 转换） |
+| 2 | **温度区间** | 最小值 / 最大值 / 步长（°C） |
+| 3 | **培养基 JSON** | 交换反应 ID + 摄取速率 |
 
 ### 第 0 步 — 安装依赖
 
 ```bash
 pip install -r requirements.txt
 
-# ESM-2 蛋白质组嵌入（用于 TPC 形状预测）：
+# ESM-2（用于 TPC 形状预测）：
 pip install fair-esm          # 推荐：Facebook 官方库
 # 或：pip install transformers
 
-# FBA（可选）：
+# FBA（用于绝对生长速率定量）：
 pip install cobra carveme
 ```
 
-### 第 1 步 — 下载蛋白质组
+### 第 1 步 — 准备三类输入
 
-从 NCBI RefSeq 下载大肠杆菌 K-12 MG1655 蛋白质组：
-
-```
-登录号：GCF_000005845.2
-文件：  protein.faa
-```
+**1a. 下载蛋白质组**（NCBI RefSeq，登录号 `GCF_000005845.2`）：
 
 ```bash
 # 使用 NCBI datasets CLI（https://www.ncbi.nlm.nih.gov/datasets/）：
 datasets download genome accession GCF_000005845.2 --include protein
 unzip ncbi_dataset.zip
-# 蛋白质组 FASTA 路径：ncbi_dataset/data/GCF_000005845.2/protein.faa
+# 蛋白质组 FASTA：ncbi_dataset/data/GCF_000005845.2/protein.faa
 ```
 
-### 第 2 步 — 从蛋白质组特征预测 OGT
+> 若只有基因组 FASTA，直接传入即可，流程会自动调用 Prodigal 提取蛋白质序列。
 
-OGT MLP 直接从蛋白质组 FASTA 提取 425 维特征（氨基酸比例、二肽频率、蛋白质组属性）
-并预测 OGT，无需基因组序列或基因预测工具：
+**1b. 确定温度区间**，例如 5–80°C，步长 1°C（通过 `--temp_min/max/step` 参数设置）。
+
+**1c. 准备培养基 JSON**，格式为 BiGG 交换反应 ID → 最大摄取速率（mmol gDW⁻¹ h⁻¹）。
+仓库已提供大肠杆菌 M9 最小培养基示例（`examples/example_medium_ecoli.json`）：
+
+```json
+{
+  "EX_glc__D_e": 10.0,
+  "EX_o2_e":     20.0,
+  "EX_nh4_e":    10.0,
+  "EX_pi_e":     10.0,
+  "EX_so4_e":    10.0
+}
+```
+
+### 第 2 步 — 一键运行完整流程
 
 ```bash
-python code/OGT_predictor.py predict \
-    --fasta ncbi_dataset/data/GCF_000005845.2/protein.faa \
-    --model_dir results/ogt_mlp
+python code/TPC_predictor.py \
+    --fasta   ncbi_dataset/data/GCF_000005845.2/protein.faa \
+    --medium  examples/example_medium_ecoli.json \
+    --temp_min 5 --temp_max 80 --temp_step 1 \
+    --output  ecoli_tpc.csv
 ```
+
+脚本自动完成：
+1. 提取 425 维蛋白质特征 → OGT MLP 预测 OGT
+2. ESM-2 均值池化嵌入 → UDE/UTPC 预测归一化 TPC 形状
+3. CarveMe 重建 GEM + COBRApy FBA → 峰值生长速率
+4. 形状 × 峰值速率 → 绝对 TPC 写入 `ecoli_tpc.csv`
 
 预期输出：
 ```
-Predicted OGT: 36.8 C
+[OGT] Predicted OGT = 36.8 C
+[ESM] Embedding 4321 proteins with ESM-2 ...
+[FBA] Growth rate = 0.9821 h-1
+
+Results saved to: ecoli_tpc.csv
+OGT used:   36.8 C
+UTPC Pmax:  3.2415
+UTPC E:     8.7632
+Plot saved to: ecoli_tpc.png
 ```
 
-> 若已知 OGT，可跳过此步，在第 4 步直接通过参数指定：`ogt_c = 37.0`。
-
-### 第 3 步 — 计算 ESM-2 蛋白质组嵌入
-
-用 ESM-2 对所有蛋白质进行嵌入并均值池化（使用与第 2 步相同的 FASTA 文件）：
-
-```python
-import esm, torch, numpy as np
-
-model_esm, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-model_esm.eval()
-batch_converter = alphabet.get_batch_converter()
-
-# 读取蛋白质序列
-seqs = []
-with open("ncbi_dataset/data/GCF_000005845.2/protein.faa") as f:
-    h, s = "", ""
-    for line in f:
-        line = line.strip()
-        if line.startswith(">"):
-            if h and s: seqs.append((h, s))
-            h = line[1:].split()[0]; s = ""
-        else:
-            s += line
-    if h and s: seqs.append((h, s))
-
-# 分批嵌入并均值池化
-embeddings = []
-for i in range(0, len(seqs), 8):
-    batch = [(h, s[:1022]) for h, s in seqs[i:i+8]]
-    _, _, tokens = batch_converter(batch)
-    with torch.no_grad():
-        out = model_esm(tokens, repr_layers=[33])
-    for j, (_, s) in enumerate(batch):
-        embeddings.append(out["representations"][33][j, 1:len(s)+1].mean(0).numpy())
-
-esm_embedding = np.mean(embeddings, axis=0).astype(np.float32)  # shape (1280,)
-np.save("ecoli_esm_embedding.npy", esm_embedding)
-print(f"ESM 嵌入维度：{esm_embedding.shape}")
-```
-
-### 第 4 步 — 预测归一化 TPC 形状
-
-```python
-import numpy as np, sys
-sys.path.insert(0, "code")
-from TPC_predictor import load_model, predict_shape, plot_prediction
-
-# 加载模型
-model, scaler, meta, device = load_model()
-
-# 加载嵌入和预测 OGT
-esm_embedding = np.load("ecoli_esm_embedding.npy")
-ogt_c         = 36.8   # 第 2 步预测值（或直接用已知值 37.0）
-temperatures  = np.arange(5, 75, 1, dtype=np.float32)
-
-# 预测
-result = predict_shape(model, scaler, meta, device,
-                       esm_embedding=esm_embedding,
-                       ogt_c=ogt_c,
-                       temperatures=temperatures)
-
-print(f"Topt:    {result['ToptC']:.1f} C")
-print(f"Pmax:    {result['Pmax']:.4f}")
-print(f"E:       {result['E']:.4f}")
-print(f"峰值温度：{temperatures[result['pred_shape'].argmax()]:.0f} C")
-
-# 保存结果
-import pandas as pd
-pd.DataFrame({"temperature_C": result["temperatures"],
-              "norm_shape":    result["pred_shape"]}).to_csv("ecoli_tpc.csv", index=False)
-plot_prediction(result, title="大肠杆菌 K-12 MG1655", save_path="ecoli_tpc.png")
-```
-
-`ecoli_tpc.csv` 前几行示例：
+`ecoli_tpc.csv`：
 
 ```
-temperature_C,norm_shape
-5.0,0.012
-10.0,0.041
-15.0,0.112
+temperature_C,norm_shape,abs_growth_rate_per_h
+5.0,0.012,0.0118
 ...
-37.0,1.000
+37.0,1.000,0.9821
 ...
-55.0,0.023
+80.0,0.001,0.0010
 ```
 
-### 第 5 步 — （可选）FBA 绝对生长速率锚定
+> **仅输出归一化曲线：** 去掉 `--medium` 参数（无需 CarveMe）。  
+> **已知 OGT：** 添加 `--ogt 37.0` 跳过 OGT 预测步骤。
+
+### 第 3 步 — Python API（高级用法）
 
 ```python
-import sys, json, numpy as np
+import numpy as np, json, sys
 sys.path.insert(0, "code")
-from FBA_anchor_point import get_peak_growth_rate
+from TPC_predictor import run_pipeline
 
 with open("examples/example_medium_ecoli.json") as f:
     medium = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
 
-# 重建 GEM 并运行 FBA
-peak_rate = get_peak_growth_rate(
-    fasta_path    = "ncbi_dataset/data/GCF_000005845.2/GCF_000005845.2_ASM584v2_genomic.fna",
-    medium        = medium,
-    temperature_c = 37.0,
+result = run_pipeline(
+    fasta_path   = "ncbi_dataset/data/GCF_000005845.2/protein.faa",
+    temperatures = np.arange(5, 81, 1, dtype=np.float32),
+    medium       = medium,       # 省略则仅输出归一化曲线
+    # ogt_c      = 37.0,         # 取消注释可直接指定 OGT
 )
-print(f"FBA 峰值生长速率：{peak_rate:.4f} h-1")
 
-# 将归一化曲线转换为绝对生长速率
-absolute_tpc = result["pred_shape"] * peak_rate
-```
+print(f"OGT：{result['ogt_c']:.1f} C")
+print(f"峰值生长速率：{result['abs_growth_rate'].max():.4f} h-1")
 
-预期输出：
-```
-FBA 峰值生长速率：0.9821 h-1
+import pandas as pd
+pd.DataFrame({
+    "temperature_C":         result["temperatures"],
+    "norm_shape":            result["norm_shape"],
+    "abs_growth_rate_per_h": result["abs_growth_rate"],
+}).to_csv("ecoli_tpc.csv", index=False)
 ```
 
 > **注意：** CarveMe 需要有效的 DIAMOND 数据库及兼容的求解器（CPLEX 或 GLPK），
 > 详见 https://carveme.readthedocs.io。
-
-### 第 6 步 — 运行内置示例
-
-以上步骤已在 `examples/example_ecoli.py` 中预置（使用占位嵌入向量）。
-替换 `esm_embedding` 变量为真实嵌入后运行：
-
-```bash
-python examples/example_ecoli.py
-# 输出：examples/output/ecoli_tpc.csv
-#        examples/output/ecoli_tpc.png
-```
 
 ---
 
@@ -381,7 +333,7 @@ python code/core_model.py --data data/your_tpc_dataset.csv
 
 ## OGT 模型性能
 
-基于 3131 个基因组（2869 细菌 + 262 古菌，GTDB 分类）的 526 维基因组特征，10 折交叉验证结果：
+基于 3131 个基因组（2869 细菌 + 262 古菌，GTDB 分类）的 425 维蛋白质序列特征，10 折交叉验证结果：
 
 | 评估方式 | RMSE（°C） | MAE（°C） | R² |
 |---|---|---|---|
