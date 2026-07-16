@@ -358,4 +358,4 @@ python code/core_model.py --data data/your_tpc_dataset.csv
 
 ## 许可证
 
-MIT
+学术非商业许可证（Academic Non-Commercial License）——仅限非商业学术与科研用途免费使用，需保留署名；商业用途需事先获得书面许可。完整条款见 [LICENSE](LICENSE)。

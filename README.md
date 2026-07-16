@@ -371,4 +371,4 @@ If you use this toolkit in your research, please cite:
 
 ## License
 
-MIT
+Academic Non-Commercial License — free for non-commercial academic and research use, with attribution required. Commercial use requires prior written permission. See [LICENSE](LICENSE) for full terms.
